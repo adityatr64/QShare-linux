@@ -36,14 +36,15 @@ An interoperable, native Linux desktop application and receiver daemon for **Goo
 
 ## 📦 System Prerequisites
 
-On Debian / Ubuntu / Fedora:
-
 ```bash
+# Arch Linux
+sudo pacman -S --needed libadwaita gtk4 gdk-pixbuf2 avahi protobuf
+
 # Ubuntu / Debian
-sudo apt-get install -y libadwaita-1-dev libgtk-4-dev libgdk-pixbuf-2.0-dev avahi-daemon
+sudo apt-get install -y libadwaita-1-dev libgtk-4-dev libgdk-pixbuf-2.0-dev avahi-daemon protobuf-compiler
 
 # Fedora
-sudo dnf install -y libadwaita-devel gtk4-devel gdk-pixbuf2-devel avahi
+sudo dnf install -y libadwaita-devel gtk4-devel gdk-pixbuf2-devel avahi protobuf-compiler
 ```
 
 ---
