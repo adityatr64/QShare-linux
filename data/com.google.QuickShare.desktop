@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=QShare
+Name=Quick Share
 GenericName=File Transfer
 Comment=Send and receive files with Android and ChromeOS devices via Google Quick Share
 Exec=QShare-linux
@@ -8,5 +8,6 @@ Terminal=false
 Type=Application
 Categories=Network;FileTransfer;GTK;
 StartupNotify=true
+StartupWMClass=com.google.QuickShare
 Keywords=QShare;QuickShare;NearbyShare;Nearby;Share;Android;Transfer;File;
 X-Purism-FormFactor=Workstation;Mobile;

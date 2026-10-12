@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Quick Share Linux - System and Desktop Installer
-# Installs quickshare-receiver binary, desktop entry, scalable application icon,
+# Installs QShare-linux binary, desktop entry, scalable application icon,
 # systemd user service, and configures local firewall rules.
 
 set -euo pipefail
@@ -75,16 +75,21 @@ do_uninstall() {
     echo "[INFO] Uninstalling QShare Linux ($MODE)..."
     rm -f "${BIN_DIR}/${BIN_NAME}"
     rm -f "${BIN_DIR}/qshare-linux"
+    rm -f "${BIN_DIR}/quickshare-receiver"
     rm -f "${APP_DIR}/${DESKTOP_ID}.desktop"
     rm -f "${ICON_DIR}/${DESKTOP_ID}.svg"
     rm -f "${PIXMAP_DIR}/${DESKTOP_ID}.svg"
     rm -f "${SYSTEMD_USER_DIR}/${SERVICE_NAME}.service"
+    rm -f "${SYSTEMD_USER_DIR}/quickshare-receiver.service"
 
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "${APP_DIR}" 2>/dev/null || true
     fi
     if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ "$MODE" = "system" ]; then
         gtk-update-icon-cache -q -t "${PREFIX}/share/icons/hicolor" 2>/dev/null || true
+    fi
+    if command -v kbuildsycoca6 >/dev/null 2>&1; then
+        kbuildsycoca6 2>/dev/null || true
     fi
 
     echo "[SUCCESS] Quick Share uninstalled successfully."
@@ -121,22 +126,35 @@ fi
 # 2. Create required directory hierarchy
 mkdir -p "${BIN_DIR}" "${APP_DIR}" "${ICON_DIR}" "${PIXMAP_DIR}" "${SYSTEMD_USER_DIR}"
 
-# 3. Install binary
+# 3. Install binary and compatibility links
 echo "[INFO] Installing binary to ${BIN_DIR}/${BIN_NAME}..."
 install -Dm755 "${SCRIPT_DIR}/target/release/${BIN_NAME}" "${BIN_DIR}/${BIN_NAME}"
 ln -sf "${BIN_NAME}" "${BIN_DIR}/qshare-linux"
+ln -sf "${BIN_NAME}" "${BIN_DIR}/quickshare-receiver"
 
-# 4. Install Desktop Entry
+# 4. Install Desktop Entry and remove stale user overrides if running system-wide
 echo "[INFO] Installing desktop file to ${APP_DIR}/${DESKTOP_ID}.desktop..."
 install -Dm644 "${SCRIPT_DIR}/data/${DESKTOP_ID}.desktop" "${APP_DIR}/${DESKTOP_ID}.desktop"
+
+# Clean up stale user desktop entry if installing system-wide or if stale quickshare-receiver
+if [ -n "${HOME:-}" ] && [ -f "${HOME}/.local/share/applications/${DESKTOP_ID}.desktop" ]; then
+    if grep -q "quickshare-receiver" "${HOME}/.local/share/applications/${DESKTOP_ID}.desktop" 2>/dev/null; then
+        echo "[INFO] Updating stale user desktop launcher in ~/.local/share/applications/..."
+        install -Dm644 "${SCRIPT_DIR}/data/${DESKTOP_ID}.desktop" "${HOME}/.local/share/applications/${DESKTOP_ID}.desktop"
+    fi
+fi
 
 # 5. Install Scalable Application Icon
 echo "[INFO] Installing SVG application icon to ${ICON_DIR}/${DESKTOP_ID}.svg..."
 install -Dm644 "${SCRIPT_DIR}/data/icons/hicolor/scalable/apps/${DESKTOP_ID}.svg" "${ICON_DIR}/${DESKTOP_ID}.svg"
 install -Dm644 "${SCRIPT_DIR}/data/icons/hicolor/scalable/apps/${DESKTOP_ID}.svg" "${PIXMAP_DIR}/${DESKTOP_ID}.svg" 2>/dev/null || true
 
-# 6. Install systemd user service
+# 6. Install systemd user service & purge legacy service
 echo "[INFO] Installing systemd user service unit..."
+rm -f "${SYSTEMD_USER_DIR}/quickshare-receiver.service" 2>/dev/null || true
+if [ -n "${HOME:-}" ]; then
+    rm -f "${HOME}/.config/systemd/user/quickshare-receiver.service" 2>/dev/null || true
+fi
 install -Dm644 "${SCRIPT_DIR}/systemd/${SERVICE_NAME}.service" "${SYSTEMD_USER_DIR}/${SERVICE_NAME}.service"
 sed -i "s|ExecStart=.*|ExecStart=${BIN_DIR}/${BIN_NAME} --headless|" "${SYSTEMD_USER_DIR}/${SERVICE_NAME}.service"
 
@@ -144,10 +162,17 @@ sed -i "s|ExecStart=.*|ExecStart=${BIN_DIR}/${BIN_NAME} --headless|" "${SYSTEMD_
 if command -v update-desktop-database >/dev/null 2>&1; then
     echo "[INFO] Updating desktop database..."
     update-desktop-database "${APP_DIR}" 2>/dev/null || true
+    if [ -n "${HOME:-}" ] && [ -d "${HOME}/.local/share/applications" ]; then
+        update-desktop-database "${HOME}/.local/share/applications" 2>/dev/null || true
+    fi
 fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     echo "[INFO] Updating icon cache..."
     gtk-update-icon-cache -q -t "${PREFIX}/share/icons/hicolor" 2>/dev/null || true
+fi
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    echo "[INFO] Updating KDE Plasma sycoca cache..."
+    kbuildsycoca6 2>/dev/null || true
 fi
 
 # 8. Firewall & Network Setup
