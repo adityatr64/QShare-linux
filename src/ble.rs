@@ -6,8 +6,6 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
@@ -29,15 +27,9 @@ impl BleAdvertiser {
 
         active.store(true, Ordering::SeqCst);
 
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             info!("Initializing Bluetooth LE Advertiser for Quick Share (UUID: 0xFEF3)...");
 
-            // 1. Build BleAdvertisement payload:
-            // [0x22 (V1, PCP 2)]
-            // [0xFC, 0x9F, 0x5E (SHA256("NearbySharing")[0..3])]
-            // [endpoint_id (4 ASCII bytes)]
-            // [endpoint_info_length]
-            // [endpoint_info: header(0x06), 16 bytes salt, name_len, name]
             let dev_bytes = name.as_bytes();
             let dev_len = dev_bytes.len().min(32) as u8;
 
@@ -65,25 +57,22 @@ impl BleAdvertiser {
                 hex_payload
             );
 
-            let mut child = match Command::new("bluetoothctl")
+            let cmd = std::process::Command::new("bluetoothctl")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Failed to spawn bluetoothctl for BLE advertising: {:?}", e);
-                    return;
+                .spawn();
+
+            if let Ok(mut child) = cmd {
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(script.as_bytes());
                 }
-            };
-
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(script.as_bytes()).await;
+                let _ = child.wait();
+                info!("Bluetooth LE Advertisement (0xFEF3) registered successfully with endpoint ID [{}]", ep_id);
+            } else {
+                warn!("Failed to spawn bluetoothctl for BLE advertising");
             }
-
-            let _ = child.wait().await;
-            info!("Bluetooth LE Advertisement (0xFEF3) registered successfully with endpoint ID [{}]", ep_id);
         });
 
         Ok(())
