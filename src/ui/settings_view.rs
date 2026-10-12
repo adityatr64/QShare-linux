@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 pub struct SettingsView {
-    pub container: gtk::Box,
+    pub page: adw::PreferencesPage,
     pub name_entry: adw::EntryRow,
     pub download_row: adw::ActionRow,
     pub download_path_label: gtk::Label,
@@ -19,17 +19,13 @@ pub struct SettingsView {
 
 impl SettingsView {
     pub fn new(default_name: &str, default_download: PathBuf, default_port: u16, local_ip: &str) -> Self {
-        let container = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        container.set_margin_start(16);
-        container.set_margin_end(16);
-        container.set_margin_top(16);
-        container.set_margin_bottom(16);
+        let page = adw::PreferencesPage::new();
 
         let current_download_dir = Rc::new(RefCell::new(default_download.clone()));
 
         // ================= 1. Device Identity =================
         let identity_group = adw::PreferencesGroup::new();
-        identity_group.set_title("Device Identity");
+        identity_group.set_title("Device and Sharing Identity");
         identity_group.set_description(Some("Configure how this computer appears to other Quick Share devices"));
 
         let name_entry = adw::EntryRow::builder()
@@ -50,7 +46,7 @@ impl SettingsView {
             .subtitle(&*default_download.to_string_lossy())
             .build();
 
-        let download_path_label = gtk::Label::new(Some(&default_download.to_string_lossy()));
+        let download_path_label = gtk::Label::new(Some(&*default_download.to_string_lossy()));
 
         let change_folder_btn = gtk::Button::builder()
             .label("Change...")
@@ -60,11 +56,11 @@ impl SettingsView {
         download_row.add_suffix(&change_folder_btn);
 
         identity_group.add(&download_row);
-        container.append(&identity_group);
+        page.add(&identity_group);
 
         // ================= 2. Network & Service =================
         let network_group = adw::PreferencesGroup::new();
-        network_group.set_title("Network & Service");
+        network_group.set_title("Network and Service");
 
         let ip_row = adw::ActionRow::builder()
             .title("Local IP Address")
@@ -82,11 +78,11 @@ impl SettingsView {
         mdns_row.add_prefix(&mdns_icon);
         network_group.add(&mdns_row);
 
-        container.append(&network_group);
+        page.add(&network_group);
 
         // ================= 3. Cryptography & Protocol =================
         let proto_group = adw::PreferencesGroup::new();
-        proto_group.set_title("Security & Protocol Architecture");
+        proto_group.set_title("Security and Protocol Architecture");
         proto_group.set_description(Some("Reconstructed from Nearby Share binary reverse-engineering"));
 
         let ukey2_row = adw::ActionRow::builder()
@@ -98,7 +94,7 @@ impl SettingsView {
         proto_group.add(&ukey2_row);
 
         let enc_row = adw::ActionRow::builder()
-            .title("Wire Framing & Encryption")
+            .title("Wire Framing and Encryption")
             .subtitle("AES-256-CBC Ciphertext + HMAC-SHA256 Authenticated SecureMessage Envelope")
             .build();
         let enc_icon = gtk::Image::from_icon_name("security-high-symbolic");
@@ -113,10 +109,10 @@ impl SettingsView {
         proto_row.add_prefix(&doc_icon);
         proto_group.add(&proto_row);
 
-        container.append(&proto_group);
+        page.add(&proto_group);
 
         Self {
-            container,
+            page,
             name_entry,
             download_row,
             download_path_label,

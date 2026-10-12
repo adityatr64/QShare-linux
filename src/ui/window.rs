@@ -34,30 +34,24 @@ impl MainWindow {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Quick Share")
-            .default_width(780)
-            .default_height(680)
+            .default_width(800)
+            .default_height(700)
             .build();
 
         let toast_overlay = adw::ToastOverlay::new();
-
-        // Main vertical layout
-        let root_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
         // Header Bar
         let header_bar = adw::HeaderBar::new();
 
         // View Stack
         let view_stack = adw::ViewStack::new();
+        view_stack.set_vexpand(true);
+        view_stack.set_hexpand(true);
 
         // 1. Receive View
         let receive_view = Rc::new(ReceiveView::new());
-        let scrolled_receive = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .child(&receive_view.container)
-            .build();
         view_stack.add_titled_with_icon(
-            &scrolled_receive,
+            &receive_view.page,
             Some("receive"),
             "Receive",
             "folder-download-symbolic",
@@ -65,13 +59,8 @@ impl MainWindow {
 
         // 2. Send View
         let send_view = Rc::new(SendView::new());
-        let scrolled_send = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .child(&send_view.container)
-            .build();
         view_stack.add_titled_with_icon(
-            &scrolled_send,
+            &send_view.page,
             Some("send"),
             "Send",
             "mail-send-symbolic",
@@ -84,17 +73,15 @@ impl MainWindow {
             port,
             local_ip,
         ));
-        let scrolled_settings = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .child(&settings_view.container)
-            .build();
         view_stack.add_titled_with_icon(
-            &scrolled_settings,
+            &settings_view.page,
             Some("settings"),
             "Settings",
             "emblem-system-symbolic",
         );
+
+        // Ensure Receive view is visible by default
+        view_stack.set_visible_child_name("receive");
 
         // View Switcher in HeaderBar
         let view_switcher = adw::ViewSwitcher::builder()
@@ -103,9 +90,12 @@ impl MainWindow {
             .build();
         header_bar.set_title_widget(Some(&view_switcher));
 
-        root_box.append(&header_bar);
-        root_box.append(&view_stack);
-        toast_overlay.set_child(Some(&root_box));
+        // Use ToolbarView to properly dock HeaderBar and expand ViewStack content
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&view_stack));
+
+        toast_overlay.set_child(Some(&toolbar_view));
         window.set_content(Some(&toast_overlay));
 
         let ip_parsed = local_ip.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
@@ -319,7 +309,7 @@ impl MainWindow {
 
         let heading = format!("Incoming Transfer from '{}'", peer_name);
         let body = format!(
-            "{}\nTotal Size: {:.2} MB\n\n═══════════════════════════════════════\n  🔐 MUTUAL VERIFICATION PIN: [ {} ]\n═══════════════════════════════════════\n\nConfirm that this 4-digit code matches the sender's screen before accepting.",
+            "{}\nTotal Size: {:.2} MB\n\n═══════════════════════════════════════\n  🔐 MUTUAL VERIFICATION PIN: [ {} ]\n═══════════════════════════════════════\n\nConfirm that this 4-digit code matches the sender device screen before accepting.",
             file_summary, total_mb, pin
         );
 
@@ -355,7 +345,7 @@ fn show_qr_connect_dialog(
 ) {
     let dialog = adw::MessageDialog::new(
         Some(parent),
-        Some("Connect via QR / Direct Connection"),
+        Some("Connect via QR or Direct Connection"),
         Some("Enter a quickshare:// URL, JSON payload, or IP:Port (e.g. 192.168.1.100:8765)"),
     );
 
@@ -370,7 +360,7 @@ fn show_qr_connect_dialog(
 
     dialog.set_extra_child(Some(&entry));
     dialog.add_response("cancel", "Cancel");
-    dialog.add_response("connect", "Connect & Add Target");
+    dialog.add_response("connect", "Connect and Add Target");
     dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("connect"));
 

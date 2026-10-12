@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use ui::window::MainWindow;
 
@@ -98,6 +98,22 @@ fn main() -> Result<()> {
     run_gui(args, download_path, rt)
 }
 
+async fn bind_listener_with_fallback(preferred_port: u16) -> Result<(TcpListener, u16)> {
+    match TcpListener::bind(format!("0.0.0.0:{}", preferred_port)).await {
+        Ok(l) => Ok((l, preferred_port)),
+        Err(e) => {
+            warn!("Port {} unavailable ({:?}), trying next ports...", preferred_port, e);
+            for p in (preferred_port + 1)..=(preferred_port + 50) {
+                if let Ok(l) = TcpListener::bind(format!("0.0.0.0:{}", p)).await {
+                    info!("Bound TCP listener on alternative port {}", p);
+                    return Ok((l, p));
+                }
+            }
+            Err(e.into())
+        }
+    }
+}
+
 fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> Result<()> {
     let app = adw::Application::builder()
         .application_id("com.google.QuickShare")
@@ -110,6 +126,18 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
+        // 1. Bind TCP listener first with fallback if preferred port is busy
+        let (listener, actual_port) = match rt_handle.block_on(bind_listener_with_fallback(args.port)) {
+            Ok(res) => res,
+            Err(e) => {
+                error!("Fatal: Failed to bind TCP listener: {:?}", e);
+                return;
+            }
+        };
+
+        info!("TCP Listener successfully bound on 0.0.0.0:{}", actual_port);
+
+        // 2. Start mDNS advertiser with the actual port
         let advertiser = Arc::new(Mutex::new(match MdnsAdvertiser::new() {
             Ok(a) => a,
             Err(e) => {
@@ -118,25 +146,23 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             }
         }));
 
-        // Initial mDNS advertisement
         let endpoint_id = {
             let adv = advertiser.clone();
             let name = args.name.clone();
-            let port = args.port;
             rt_handle.block_on(async move {
                 adv.lock()
                     .await
-                    .start_advertising(&name, port, None)
+                    .start_advertising(&name, actual_port, None)
                     .unwrap_or_else(|_| "LNX1".to_string())
             })
         };
 
-        // Create UI main window
+        // 3. Create UI main window
         let main_window = Rc::new(MainWindow::new(
             app,
             &args.name,
             download_path.clone(),
-            args.port,
+            actual_port,
             &local_ip,
             &endpoint_id,
         ));
@@ -154,7 +180,7 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             }
         });
 
-        // 1. Start mDNS Browser background task
+        // 4. Start mDNS Browser background task
         let browser_tx = app_tx.clone();
         rt_handle.spawn(async move {
             if let Ok(browser) = MdnsBrowser::new() {
@@ -166,42 +192,33 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             }
         });
 
-        // 2. Start TCP Listener background task
-        let bind_addr = format!("0.0.0.0:{}", args.port);
+        // 5. Start TCP Listener accept loop
         let listener_tx = app_tx.clone();
         let dest_dir = download_path.clone();
         let rt_h = rt_handle.clone();
 
         rt_handle.spawn(async move {
-            match TcpListener::bind(&bind_addr).await {
-                Ok(listener) => {
-                    info!("TCP listener bound on {}", bind_addr);
-                    loop {
-                        match listener.accept().await {
-                            Ok((stream, peer_addr)) => {
-                                info!("Accepted incoming connection from {}", peer_addr);
-                                let d_dir = dest_dir.clone();
-                                let s_tx = listener_tx.clone();
-                                rt_h.spawn(async move {
-                                    let session = QuickShareSession::new(stream, d_dir, Some(s_tx));
-                                    if let Err(e) = session.run().await {
-                                        error!("Session error with {}: {:?}", peer_addr, e);
-                                    }
-                                });
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer_addr)) => {
+                        info!("Accepted incoming connection from {}", peer_addr);
+                        let d_dir = dest_dir.clone();
+                        let s_tx = listener_tx.clone();
+                        rt_h.spawn(async move {
+                            let session = QuickShareSession::new(stream, d_dir, Some(s_tx));
+                            if let Err(e) = session.run().await {
+                                error!("Session error with {}: {:?}", peer_addr, e);
                             }
-                            Err(e) => {
-                                error!("TCP accept error: {:?}", e);
-                            }
-                        }
+                        });
                     }
-                }
-                Err(e) => {
-                    error!("Failed to bind TCP listener on {}: {:?}", bind_addr, e);
+                    Err(e) => {
+                        error!("TCP accept error: {:?}", e);
+                    }
                 }
             }
         });
 
-        // 3. Connect Send View "Send" action callback
+        // 6. Connect Send View "Send" action callback
         let send_tx = app_tx.clone();
         let rt_h2 = rt_handle.clone();
         let my_id = endpoint_id.clone();
@@ -233,11 +250,10 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             });
         });
 
-        // 4. Connect Visibility Switch to start/stop mDNS advertiser
+        // 7. Connect Visibility Switch to start/stop mDNS advertiser
         let adv_clone = advertiser.clone();
         let rt_h3 = rt_handle.clone();
         let dev_name = args.name.clone();
-        let dev_port = args.port;
 
         main_window
             .receive_view
@@ -246,12 +262,11 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
                 let is_active = switch.is_active();
                 let adv = adv_clone.clone();
                 let name = dev_name.clone();
-                let port = dev_port;
 
                 rt_h3.spawn(async move {
                     let mut lock = adv.lock().await;
                     if is_active {
-                        let _ = lock.start_advertising(&name, port, None);
+                        let _ = lock.start_advertising(&name, actual_port, None);
                     } else {
                         lock.stop_advertising();
                     }
@@ -294,15 +309,11 @@ async fn run_headless(args: Args, download_path: PathBuf) -> Result<()> {
     }
 
     // Otherwise run headless receiver daemon
-    let bind_addr = format!("0.0.0.0:{}", args.port);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .with_context(|| format!("Failed to bind TCP listener on {}", bind_addr))?;
-
-    info!("TCP listener bound on {}", bind_addr);
+    let (listener, actual_port) = bind_listener_with_fallback(args.port).await?;
+    info!("TCP listener bound on 0.0.0.0:{}", actual_port);
 
     let mut advertiser = MdnsAdvertiser::new()?;
-    if let Err(e) = advertiser.start_advertising(&args.name, args.port, None) {
+    if let Err(e) = advertiser.start_advertising(&args.name, actual_port, None) {
         error!("Warning: mDNS advertising failed: {:?}. Direct connections still accepted.", e);
     }
 

@@ -1,4 +1,5 @@
 use crate::events::DiscoveredPeer;
+use gtk4::gdk;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 pub struct SendView {
-    pub container: gtk::Box,
+    pub page: adw::PreferencesPage,
     pub staged_files: Rc<RefCell<Vec<PathBuf>>>,
     pub staged_box: gtk::Box,
     pub staged_placeholder: gtk::Label,
@@ -24,11 +25,7 @@ pub struct SendView {
 
 impl SendView {
     pub fn new() -> Self {
-        let container = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        container.set_margin_start(16);
-        container.set_margin_end(16);
-        container.set_margin_top(16);
-        container.set_margin_bottom(16);
+        let page = adw::PreferencesPage::new();
 
         let staged_files = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
         let discovered_peers = Rc::new(RefCell::new(HashMap::<String, (DiscoveredPeer, gtk::Box)>::new()));
@@ -37,7 +34,7 @@ impl SendView {
         // ================= 1. Staged Files Section =================
         let stage_group = adw::PreferencesGroup::new();
         stage_group.set_title("Files to Share");
-        stage_group.set_description(Some("Select files to share or drag & drop them directly into this area"));
+        stage_group.set_description(Some("Select files to share or drag and drop them directly into this area"));
 
         let stage_card = gtk::Box::new(gtk::Orientation::Vertical, 8);
         stage_card.add_css_class("card");
@@ -83,7 +80,7 @@ impl SendView {
 
         stage_card.append(&staged_box);
         stage_group.add(&stage_card);
-        container.append(&stage_group);
+        page.add(&stage_group);
 
         // ================= 2. Nearby Devices Section =================
         let peers_group = adw::PreferencesGroup::new();
@@ -113,10 +110,46 @@ impl SendView {
 
         peers_group.add(&peers_placeholder);
         peers_group.add(&peers_box);
-        container.append(&peers_group);
+        page.add(&peers_group);
+
+        // Setup Drag & Drop controller on stage_card
+        let drop_target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let staged_files_clone = staged_files.clone();
+        let staged_box_clone = staged_box.clone();
+        let clear_btn_clone = clear_files_btn.clone();
+        let placeholder_clone = staged_placeholder.clone();
+
+        drop_target.connect_drop(move |_target, value, _x, _y| {
+            if let Ok(file_list) = value.get::<gdk::FileList>() {
+                let mut paths = Vec::new();
+                for file in file_list.files() {
+                    if let Some(path) = file.path() {
+                        paths.push(path);
+                    }
+                }
+                if !paths.is_empty() {
+                    let mut staged = staged_files_clone.borrow_mut();
+                    for path in paths {
+                        if !staged.contains(&path) {
+                            staged.push(path);
+                        }
+                    }
+                    drop(staged);
+                    refresh_staged_helper(
+                        &staged_files_clone,
+                        &staged_box_clone,
+                        &clear_btn_clone,
+                        &placeholder_clone,
+                    );
+                    return true;
+                }
+            }
+            false
+        });
+        stage_card.add_controller(drop_target);
 
         Self {
-            container,
+            page,
             staged_files,
             staged_box,
             staged_placeholder,
@@ -151,78 +184,12 @@ impl SendView {
     }
 
     fn refresh_staged_ui(&self) {
-        // Clear children of staged_box
-        while let Some(child) = self.staged_box.first_child() {
-            self.staged_box.remove(&child);
-        }
-
-        let staged = self.staged_files.borrow();
-        let has_files = !staged.is_empty();
-        self.clear_files_btn.set_sensitive(has_files);
-
-        if !has_files {
-            self.staged_box.append(&self.staged_placeholder);
-            return;
-        }
-
-        for (idx, path) in staged.iter().enumerate() {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            row.add_css_class("card");
-            row.set_margin_top(2);
-            row.set_margin_bottom(2);
-            row.set_margin_start(4);
-            row.set_margin_end(4);
-
-            let icon = gtk::Image::from_icon_name("text-x-generic-symbolic");
-            icon.set_margin_start(8);
-
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Unknown File".to_string());
-            let size = std::fs::metadata(path)
-                .map(|m| format!("{:.2} MB", m.len() as f64 / 1_048_576.0))
-                .unwrap_or_else(|_| "0 MB".to_string());
-
-            let name_label = gtk::Label::new(Some(&name));
-            name_label.set_halign(gtk::Align::Start);
-            name_label.set_hexpand(true);
-
-            let size_label = gtk::Label::new(Some(&size));
-            size_label.add_css_class("dim-label");
-
-            let remove_btn = gtk::Button::from_icon_name("window-close-symbolic");
-            remove_btn.add_css_class("flat");
-            remove_btn.set_margin_end(4);
-
-            let staged_ref = self.staged_files.clone();
-            let staged_box = self.staged_box.clone();
-            let clear_btn = self.clear_files_btn.clone();
-            let placeholder = self.staged_placeholder.clone();
-
-            remove_btn.connect_clicked(move |_| {
-                let mut files = staged_ref.borrow_mut();
-                if idx < files.len() {
-                    files.remove(idx);
-                }
-                let is_empty = files.is_empty();
-                drop(files);
-                clear_btn.set_sensitive(!is_empty);
-
-                if is_empty {
-                    while let Some(child) = staged_box.first_child() {
-                        staged_box.remove(&child);
-                    }
-                    staged_box.append(&placeholder);
-                }
-            });
-
-            row.append(&icon);
-            row.append(&name_label);
-            row.append(&size_label);
-            row.append(&remove_btn);
-            self.staged_box.append(&row);
-        }
+        refresh_staged_helper(
+            &self.staged_files,
+            &self.staged_box,
+            &self.clear_files_btn,
+            &self.staged_placeholder,
+        );
     }
 
     pub fn add_peer(&self, peer: DiscoveredPeer) {
@@ -295,5 +262,81 @@ impl SendView {
         if peers.is_empty() {
             self.peers_placeholder.set_visible(true);
         }
+    }
+}
+
+fn refresh_staged_helper(
+    staged_files: &Rc<RefCell<Vec<PathBuf>>>,
+    staged_box: &gtk::Box,
+    clear_files_btn: &gtk::Button,
+    staged_placeholder: &gtk::Label,
+) {
+    while let Some(child) = staged_box.first_child() {
+        staged_box.remove(&child);
+    }
+
+    let staged = staged_files.borrow();
+    let has_files = !staged.is_empty();
+    clear_files_btn.set_sensitive(has_files);
+
+    if !has_files {
+        staged_box.append(staged_placeholder);
+        return;
+    }
+
+    for (idx, path) in staged.iter().enumerate() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        row.add_css_class("card");
+        row.set_margin_top(2);
+        row.set_margin_bottom(2);
+        row.set_margin_start(4);
+        row.set_margin_end(4);
+
+        let icon = gtk::Image::from_icon_name("text-x-generic-symbolic");
+        icon.set_margin_start(8);
+
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Unknown File".to_string());
+        let size = std::fs::metadata(path)
+            .map(|m| format!("{:.2} MB", m.len() as f64 / 1_048_576.0))
+            .unwrap_or_else(|_| "0 MB".to_string());
+
+        let name_label = gtk::Label::new(Some(&name));
+        name_label.set_halign(gtk::Align::Start);
+        name_label.set_hexpand(true);
+
+        let size_label = gtk::Label::new(Some(&size));
+        size_label.add_css_class("dim-label");
+
+        let remove_btn = gtk::Button::from_icon_name("window-close-symbolic");
+        remove_btn.add_css_class("flat");
+        remove_btn.set_margin_end(4);
+
+        let staged_ref = staged_files.clone();
+        let staged_box_clone = staged_box.clone();
+        let clear_btn_clone = clear_files_btn.clone();
+        let placeholder_clone = staged_placeholder.clone();
+
+        remove_btn.connect_clicked(move |_| {
+            let mut files = staged_ref.borrow_mut();
+            if idx < files.len() {
+                files.remove(idx);
+            }
+            drop(files);
+            refresh_staged_helper(
+                &staged_ref,
+                &staged_box_clone,
+                &clear_btn_clone,
+                &placeholder_clone,
+            );
+        });
+
+        row.append(&icon);
+        row.append(&name_label);
+        row.append(&size_label);
+        row.append(&remove_btn);
+        staged_box.append(&row);
     }
 }

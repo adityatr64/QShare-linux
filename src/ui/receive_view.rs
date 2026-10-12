@@ -104,7 +104,7 @@ impl TransferCard {
 }
 
 pub struct ReceiveView {
-    pub container: gtk::Box,
+    pub page: adw::PreferencesPage,
     pub visibility_switch: adw::SwitchRow,
     pub qr_image: gtk::Image,
     pub qr_link_label: gtk::Label,
@@ -117,11 +117,7 @@ pub struct ReceiveView {
 
 impl ReceiveView {
     pub fn new() -> Self {
-        let container = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        container.set_margin_start(16);
-        container.set_margin_end(16);
-        container.set_margin_top(16);
-        container.set_margin_bottom(16);
+        let page = adw::PreferencesPage::new();
 
         // 1. Visibility Preferences Group
         let vis_group = adw::PreferencesGroup::new();
@@ -133,11 +129,11 @@ impl ReceiveView {
             .active(true)
             .build();
         vis_group.add(&visibility_switch);
-        container.append(&vis_group);
+        page.add(&vis_group);
 
         // 2. Direct QR Pairing Presentation Tile
         let qr_group = adw::PreferencesGroup::new();
-        qr_group.set_title("Direct Connection / QR Pairing");
+        qr_group.set_title("Direct Connection and QR Pairing");
         qr_group.set_description(Some("Nearby devices can scan or use this direct URI to bypass discovery"));
 
         let qr_card = gtk::Box::new(gtk::Orientation::Horizontal, 16);
@@ -182,7 +178,7 @@ impl ReceiveView {
         qr_card.append(&qr_image);
         qr_card.append(&qr_details);
         qr_group.add(&qr_card);
-        container.append(&qr_group);
+        page.add(&qr_group);
 
         // 3. Active / Recent Transfers Area
         let trans_group = adw::PreferencesGroup::new();
@@ -199,12 +195,12 @@ impl ReceiveView {
 
         trans_group.add(&empty_placeholder);
         trans_group.add(&transfers_box);
-        container.append(&trans_group);
+        page.add(&trans_group);
 
         let qr_uri = Rc::new(RefCell::new(String::new()));
 
         Self {
-            container,
+            page,
             visibility_switch,
             qr_image,
             qr_link_label,
