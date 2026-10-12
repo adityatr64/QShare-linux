@@ -139,16 +139,20 @@ impl QuickShareSession {
         write_length_prefixed_frame(&mut self.stream, &raw_resp_bytes).await?;
         info!("Sent unencrypted Connection Response (ACCEPT)");
 
-        // 4. Notify UI that this peer connected and is available
+        // 4. Notify UI that this peer connected and is available (ignore self/loopback connections)
         if let Ok(peer_addr) = self.stream.peer_addr() {
-            if let Some(ref tx) = self.ui_sender {
-                let _ = tx.send(AppEvent::PeerDiscovered(DiscoveredPeer {
-                    id: format!("phone_{}", peer_addr.ip().to_string().replace('.', "_")),
-                    name: self.remote_device_name.clone(),
-                    device_type: DeviceType::Phone,
-                    ip: peer_addr.ip(),
-                    port: 53601,
-                }));
+            if !crate::discovery::is_self_ip(&peer_addr.ip()) {
+                if let Some(ref tx) = self.ui_sender {
+                    let _ = tx.send(AppEvent::PeerDiscovered(DiscoveredPeer {
+                        id: format!("phone_{}", peer_addr.ip().to_string().replace('.', "_")),
+                        name: self.remote_device_name.clone(),
+                        device_type: DeviceType::Phone,
+                        ip: peer_addr.ip(),
+                        port: 53601,
+                    }));
+                }
+            } else {
+                debug!("Ignored incoming connection from self/loopback ({}) for peer discovery", peer_addr.ip());
             }
         }
 

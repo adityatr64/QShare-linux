@@ -1387,6 +1387,7 @@ dependencies = [
  "gtk4",
  "hkdf 0.12.4",
  "hmac 0.12.1",
+ "if-addrs",
  "libadwaita",
  "mdns-sd",
  "p256",

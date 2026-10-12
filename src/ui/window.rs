@@ -18,6 +18,9 @@ pub struct MainWindow {
     pub receive_view: Rc<ReceiveView>,
     pub send_view: Rc<SendView>,
     pub settings_view: Rc<SettingsView>,
+    pub device_name: Rc<RefCell<String>>,
+    pub endpoint_id: Rc<RefCell<String>>,
+    pub port: u16,
 }
 
 impl MainWindow {
@@ -29,6 +32,9 @@ impl MainWindow {
         local_ip: &str,
         endpoint_id: &str,
     ) -> Self {
+        let dev_name_rc = Rc::new(RefCell::new(device_name.to_string()));
+        let ep_id_rc = Rc::new(RefCell::new(endpoint_id.to_string()));
+
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("Quick Share")
@@ -335,12 +341,35 @@ impl MainWindow {
             receive_view,
             send_view,
             settings_view,
+            device_name: dev_name_rc,
+            endpoint_id: ep_id_rc,
+            port,
         }
+    }
+
+    pub fn is_self_peer(&self, peer: &DiscoveredPeer) -> bool {
+        crate::discovery::is_self_peer_info(
+            &peer.id,
+            &peer.ip,
+            peer.port,
+            &peer.name,
+            Some(&self.endpoint_id.borrow()),
+            Some(self.port),
+            Some(&self.device_name.borrow()),
+        )
+    }
+
+    pub fn update_device_name(&self, new_name: &str) {
+        *self.device_name.borrow_mut() = new_name.to_string();
     }
 
     pub fn handle_event(&self, event: AppEvent) {
         match event {
             AppEvent::PeerDiscovered(peer) => {
+                if self.is_self_peer(&peer) {
+                    tracing::debug!("Filtered out self peer from UI: [{}] {} ({}:{})", peer.id, peer.name, peer.ip, peer.port);
+                    return;
+                }
                 let name = peer.name.clone();
                 self.send_view.add_peer(peer.clone());
                 self.receive_view.add_peer(peer);
@@ -601,6 +630,10 @@ fn show_add_ip_dialog(
 
             match ip_str.parse::<IpAddr>() {
                 Ok(ip) => {
+                    if crate::discovery::is_self_ip(&ip) {
+                        overlay.add_toast(adw::Toast::new("Cannot add this device's own IP address"));
+                        return;
+                    }
                     let port = detect_or_default_port(ip, explicit_port);
                     let peer = DiscoveredPeer {
                         id: format!("ip_{}", ip_str.replace('.', "_")),

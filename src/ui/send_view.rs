@@ -229,6 +229,10 @@ impl SendView {
     }
 
     pub fn add_peer(&self, peer: DiscoveredPeer) {
+        if crate::discovery::is_self_ip(&peer.ip) {
+            return;
+        }
+
         let mut peers = self.discovered_peers.borrow_mut();
 
         // Deduplicate by ID or IP

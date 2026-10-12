@@ -112,7 +112,7 @@ impl Drop for BleAdvertiser {
     }
 }
 
-use crate::discovery::get_local_ip;
+use crate::discovery::is_self_ip;
 use crate::events::{DeviceType, DiscoveredPeer};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -120,10 +120,9 @@ use std::net::{IpAddr, SocketAddr};
 pub struct BleScanner;
 
 impl BleScanner {
-    pub async fn run_loop(ui_sender: UnboundedSender<AppEvent>) {
+    pub async fn run_loop(ui_sender: UnboundedSender<AppEvent>, my_port: Option<u16>) {
         info!("Starting Bluetooth LE & Local LAN Background Scanner for Quick Share peers...");
         let mut known_endpoints = HashSet::new();
-        let my_ip = get_local_ip();
 
         let mut ble_cycle = 0;
         loop {
@@ -140,11 +139,15 @@ impl BleScanner {
             // 2. Scan ARP neighbors on local network
             let neighbors = get_arp_neighbors();
             for ip in neighbors {
-                if Some(ip) == my_ip || ip.is_loopback() {
+                if is_self_ip(&ip) {
                     continue;
                 }
 
                 if let Some(port) = probe_quickshare_port(ip) {
+                    if my_port.map_or(false, |p| p == port) && is_self_ip(&ip) {
+                        continue;
+                    }
+
                     let ep_key = format!("{}:{}", ip, port);
                     if known_endpoints.insert(ep_key.clone()) {
                         info!(
@@ -167,6 +170,7 @@ impl BleScanner {
         }
     }
 }
+
 
 pub fn get_arp_neighbors() -> Vec<IpAddr> {
     let mut ips = Vec::new();

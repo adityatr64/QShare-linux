@@ -30,16 +30,20 @@ impl MdnsAdvertiser {
         device_name: &str,
         port: u16,
         ip_addr: Option<IpAddr>,
+        custom_endpoint_id: Option<&str>,
     ) -> Result<String> {
         // Stop any current advertisement first
         self.stop_advertising();
 
-        // 1. Generate 4-character random endpoint ID
-        let endpoint_id: String = OsRng
-            .sample_iter(&Alphanumeric)
-            .take(4)
-            .map(char::from)
-            .collect();
+        // 1. Generate or reuse 4-character endpoint ID
+        let endpoint_id: String = match custom_endpoint_id {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => OsRng
+                .sample_iter(&Alphanumeric)
+                .take(4)
+                .map(char::from)
+                .collect(),
+        };
 
         // 2. Build WifiLanServiceInfo byte buffer
         // In Google Nearby Connections / Quick Share specification:
@@ -144,8 +148,13 @@ impl MdnsBrowser {
         Ok(Self { daemon, receiver })
     }
 
-    pub async fn run_loop<F>(self, my_endpoint_id: Option<String>, mut on_event: F)
-    where
+    pub async fn run_loop<F>(
+        self,
+        my_endpoint_id: Option<String>,
+        my_port: Option<u16>,
+        my_device_name: Option<String>,
+        mut on_event: F,
+    ) where
         F: FnMut(AppEvent) + Send + 'static,
     {
         info!("Started mDNS browsing for Quick Share peers ({})", QUICKSHARE_SERVICE_TYPE);
@@ -183,12 +192,24 @@ impl MdnsBrowser {
 
                     let (id, name, device_type) = parse_resolved_peer(instance_name, txt_n, &fullname);
 
-                    // Ignore own advertisement
-                    if let Some(ref my_id) = my_endpoint_id {
-                        if &id == my_id {
-                            debug!("Ignored self mDNS service: [{}]", id);
-                            continue;
-                        }
+                    // Ignore own advertisement:
+                    // Check if service belongs to ourselves by ID, port, IP addresses, or device name
+                    let any_addr_is_self = addresses.iter().any(|addr| is_self_ip(&addr.to_ip_addr()));
+
+                    if is_self_peer_info(
+                        &id,
+                        &ip,
+                        port,
+                        &name,
+                        my_endpoint_id.as_deref(),
+                        my_port,
+                        my_device_name.as_deref(),
+                    ) || any_addr_is_self {
+                        debug!(
+                            "Ignored self mDNS service: [{}] '{}' at {}:{}",
+                            id, name, ip, port
+                        );
+                        continue;
                     }
 
                     known_peers.insert(fullname.clone(), id.clone());
@@ -305,3 +326,159 @@ pub fn get_local_ip() -> Option<IpAddr> {
     }
     None
 }
+
+pub fn get_all_local_ips() -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if !ips.contains(&iface.ip()) {
+                ips.push(iface.ip());
+            }
+        }
+    }
+    if let Some(primary) = get_local_ip() {
+        if !ips.contains(&primary) {
+            ips.push(primary);
+        }
+    }
+    ips
+}
+
+pub fn is_self_ip(ip: &IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    let all = get_all_local_ips();
+    all.contains(ip)
+}
+
+pub fn is_self_peer_info(
+    peer_id: &str,
+    peer_ip: &IpAddr,
+    peer_port: u16,
+    peer_name: &str,
+    my_endpoint_id: Option<&str>,
+    my_port: Option<u16>,
+    my_device_name: Option<&str>,
+) -> bool {
+    // 1. Endpoint ID matches our own
+    if let Some(my_id) = my_endpoint_id {
+        if !my_id.is_empty() && peer_id == my_id {
+            return true;
+        }
+    }
+
+    // 2. IP belongs to our own machine
+    if is_self_ip(peer_ip) {
+        return true;
+    }
+
+    // 3. Port and name match our own service
+    if let (Some(my_p), Some(my_n)) = (my_port, my_device_name) {
+        if peer_port == my_p && peer_name == my_n {
+            return true;
+        }
+    }
+
+    false
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_advertiser_and_parsed_peer() {
+        let endpoint_id = "ABCD".to_string();
+        let version_and_pcp = 0x23u8;
+        let service_id_hash = [0xFCu8, 0x9Fu8, 0x5Eu8];
+
+        let mut instance_name_bytes = Vec::with_capacity(10);
+        instance_name_bytes.push(version_and_pcp);
+        instance_name_bytes.extend_from_slice(endpoint_id.as_bytes());
+        instance_name_bytes.extend_from_slice(&service_id_hash);
+        instance_name_bytes.extend_from_slice(&[0x00, 0x00]);
+        let instance_name = URL_SAFE_NO_PAD.encode(&instance_name_bytes);
+
+        let dev_name = "My Linux PC";
+        let header_byte = 0x06u8;
+        let salt = [1u8; 16];
+        let dev_bytes = dev_name.as_bytes();
+        let dev_len = dev_bytes.len().min(19) as u8;
+
+        let mut endpoint_info = Vec::with_capacity(1 + 16 + 1 + dev_len as usize);
+        endpoint_info.push(header_byte);
+        endpoint_info.extend_from_slice(&salt);
+        endpoint_info.push(dev_len);
+        endpoint_info.extend_from_slice(&dev_bytes[..dev_len as usize]);
+        let encoded_endpoint_info = URL_SAFE_NO_PAD.encode(&endpoint_info);
+
+        let mut properties = HashMap::new();
+        properties.insert("n".to_string(), encoded_endpoint_info.clone());
+
+        let host_name = format!("{}.local.", endpoint_id);
+        let service = ServiceInfo::new(
+            QUICKSHARE_SERVICE_TYPE,
+            &instance_name,
+            &host_name,
+            "192.168.1.50",
+            53601,
+            properties,
+        ).unwrap();
+
+        let fullname = service.get_fullname().to_string();
+        println!("Service fullname: {}", fullname);
+
+        let extracted_instance = fullname.split('.').next().unwrap_or("");
+        println!("Extracted instance: {}", extracted_instance);
+
+        let txt_n = service.get_property_val_str("n");
+        let (id, name, dev_type) = parse_resolved_peer(extracted_instance, txt_n, &fullname);
+        println!("Parsed: id={}, name={}, type={:?}", id, name, dev_type);
+
+        assert_eq!(id, endpoint_id);
+        assert_eq!(name, dev_name);
+    }
+
+    #[test]
+    fn test_is_self_ip_filtering() {
+        use std::str::FromStr;
+        // Loopback and unspecified must be detected as self
+        assert!(is_self_ip(&IpAddr::from_str("127.0.0.1").unwrap()));
+        assert!(is_self_ip(&IpAddr::from_str("127.0.0.2").unwrap()));
+        assert!(is_self_ip(&IpAddr::from_str("::1").unwrap()));
+        assert!(is_self_ip(&IpAddr::from_str("0.0.0.0").unwrap()));
+
+        // Local interface IPs must be detected
+        let local_ips = get_all_local_ips();
+        for lip in local_ips {
+            assert!(is_self_ip(&lip));
+        }
+
+        // Distinct external address should not be self
+        let foreign_ip = IpAddr::from_str("203.0.113.199").unwrap();
+        assert!(!is_self_ip(&foreign_ip));
+    }
+
+    #[test]
+    fn test_is_self_peer_info_detection() {
+        use std::str::FromStr;
+        let self_ip = IpAddr::from_str("127.0.0.1").unwrap();
+        let other_ip = IpAddr::from_str("192.0.2.1").unwrap();
+
+        // 1. Matches own endpoint ID
+        assert!(is_self_peer_info("ABCD", &other_ip, 53601, "Pixel 8", Some("ABCD"), Some(53601), Some("My PC")));
+
+        // 2. Matches self IP (e.g. loopback or host interface)
+        assert!(is_self_peer_info("XYZ9", &self_ip, 53601, "Pixel 8", Some("ABCD"), Some(53601), Some("My PC")));
+
+        // 3. Matches own device name and port
+        assert!(is_self_peer_info("XYZ9", &other_ip, 53601, "My PC", Some("ABCD"), Some(53601), Some("My PC")));
+
+        // 4. Truly distinct peer is NOT self
+        assert!(!is_self_peer_info("XYZ9", &other_ip, 53601, "Pixel 8", Some("ABCD"), Some(53601), Some("My PC")));
+    }
+}
+
+

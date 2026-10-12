@@ -250,7 +250,7 @@ fn run_gui(args: Args, config: AppConfig, rt: tokio::runtime::Runtime) -> Result
             rt_handle.block_on(async move {
                 adv.lock()
                     .await
-                    .start_advertising(&name, actual_port, None)
+                    .start_advertising(&name, actual_port, None, None)
                     .unwrap_or_else(|_| "LNX1".to_string())
             })
         };
@@ -296,12 +296,18 @@ fn run_gui(args: Args, config: AppConfig, rt: tokio::runtime::Runtime) -> Result
         // 5. Start mDNS Browser background task
         let browser_tx = app_tx.clone();
         let my_ep = endpoint_id.clone();
+        let my_name = dev_name.clone();
         rt_handle.spawn(async move {
             if let Ok(browser) = MdnsBrowser::new() {
                 browser
-                    .run_loop(Some(my_ep), move |event| {
-                        let _ = browser_tx.send(event);
-                    })
+                    .run_loop(
+                        Some(my_ep),
+                        Some(actual_port),
+                        Some(my_name),
+                        move |event| {
+                            let _ = browser_tx.send(event);
+                        },
+                    )
                     .await;
             }
         });
@@ -309,7 +315,7 @@ fn run_gui(args: Args, config: AppConfig, rt: tokio::runtime::Runtime) -> Result
         // 6. Start Bluetooth LE & Local LAN Peer Scanner background task
         let ble_scan_tx = app_tx.clone();
         rt_handle.spawn(async move {
-            BleScanner::run_loop(ble_scan_tx).await;
+            BleScanner::run_loop(ble_scan_tx, Some(actual_port)).await;
         });
 
         // Track active Tokio session tasks for cancellation
@@ -428,6 +434,7 @@ fn run_gui(args: Args, config: AppConfig, rt: tokio::runtime::Runtime) -> Result
         let dl_save = current_download_dir.clone();
         let rt_h_save = rt_handle.clone();
         let eid_save = endpoint_id.clone();
+        let main_window_for_settings = main_window.clone();
 
         main_window.settings_view.on_save(move |cfg| {
             let adv = adv_save.clone();
@@ -436,11 +443,12 @@ fn run_gui(args: Args, config: AppConfig, rt: tokio::runtime::Runtime) -> Result
             let eid = eid_save.clone();
             let name = cfg.device_name.clone();
             let down_dir = cfg.download_dir.clone();
+            main_window_for_settings.update_device_name(&name);
 
             rt_h_save.spawn(async move {
                 *dl.write().await = down_dir;
                 let mut lock = adv.lock().await;
-                let _ = lock.start_advertising(&name, actual_port, None);
+                let _ = lock.start_advertising(&name, actual_port, None, Some(&eid));
                 let _ = ble.start_advertising(&eid, &name);
                 info!("Updated active mDNS & BLE advertisement to device name '{}'", name);
             });
@@ -466,7 +474,7 @@ fn run_gui(args: Args, config: AppConfig, rt: tokio::runtime::Runtime) -> Result
                 rt_h3.spawn(async move {
                     let mut lock = adv.lock().await;
                     if is_active {
-                        let _ = lock.start_advertising(&name, actual_port, None);
+                        let _ = lock.start_advertising(&name, actual_port, None, Some(&eid));
                         let _ = ble.start_advertising(&eid, &name);
                     } else {
                         lock.stop_advertising();
@@ -518,7 +526,7 @@ async fn run_headless(args: Args, download_path: PathBuf) -> Result<()> {
     // Default: Headless Receive Daemon
     let (listener, actual_port) = bind_listener_with_fallback(args.port).await?;
     let mut advertiser = MdnsAdvertiser::new()?;
-    let endpoint_id = advertiser.start_advertising(&args.name, actual_port, None)?;
+    let endpoint_id = advertiser.start_advertising(&args.name, actual_port, None, None)?;
 
     let ble_adv = BleAdvertiser::new();
     let _ = ble_adv.start_advertising(&endpoint_id, &args.name);

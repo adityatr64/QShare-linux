@@ -27,6 +27,7 @@ gdk-pixbuf = "0.20"
 # Async runtime & networking
 tokio = { version = "1", features = ["full"] }
 mdns-sd = "0.21"
+if-addrs = "0.15"
 
 # Protobuf
 prost = "0.13"
