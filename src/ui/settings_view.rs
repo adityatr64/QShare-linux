@@ -1,3 +1,4 @@
+use crate::config::AppConfig;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
@@ -13,8 +14,10 @@ pub struct SettingsView {
     pub download_path_label: gtk::Label,
     pub change_folder_btn: gtk::Button,
     pub port_entry: adw::EntryRow,
+    pub save_btn: gtk::Button,
     pub ip_row: adw::ActionRow,
     pub current_download_dir: Rc<RefCell<PathBuf>>,
+    pub save_callbacks: Rc<RefCell<Vec<Box<dyn Fn(AppConfig) + 'static>>>>,
 }
 
 impl SettingsView {
@@ -22,11 +25,12 @@ impl SettingsView {
         let page = adw::PreferencesPage::new();
 
         let current_download_dir = Rc::new(RefCell::new(default_download.clone()));
+        let save_callbacks: Rc<RefCell<Vec<Box<dyn Fn(AppConfig) + 'static>>>> = Rc::new(RefCell::new(Vec::new()));
 
-        // ================= 1. Device Identity =================
+        // ================= 1. Device Identity & Preferences =================
         let identity_group = adw::PreferencesGroup::new();
-        identity_group.set_title("Device and Sharing Identity");
-        identity_group.set_description(Some("Configure how this computer appears to other Quick Share devices"));
+        identity_group.set_title("Device Identity and Preferences");
+        identity_group.set_description(Some("Configure device identity and destination folder. Settings persist in ~/.config/quickshare/settings.json"));
 
         let name_entry = adw::EntryRow::builder()
             .title("Device Name")
@@ -56,7 +60,68 @@ impl SettingsView {
         download_row.add_suffix(&change_folder_btn);
 
         identity_group.add(&download_row);
+
+        // Config file location row
+        let config_path = AppConfig::config_file_path();
+        let config_row = adw::ActionRow::builder()
+            .title("Configuration File Location")
+            .subtitle(&*config_path.to_string_lossy())
+            .build();
+        let config_icon = gtk::Image::from_icon_name("document-properties-symbolic");
+        config_row.add_prefix(&config_icon);
+        identity_group.add(&config_row);
+
+        // Save Button row
+        let save_btn = gtk::Button::builder()
+            .label("Save Changes")
+            .icon_name("emblem-ok-symbolic")
+            .valign(gtk::Align::Center)
+            .halign(gtk::Align::End)
+            .margin_top(8)
+            .margin_bottom(8)
+            .margin_end(12)
+            .build();
+        save_btn.add_css_class("suggested-action");
+
+        let save_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        save_row.set_halign(gtk::Align::End);
+        save_row.append(&save_btn);
+        identity_group.add(&save_row);
+
         page.add(&identity_group);
+
+        // Connect Save Button
+        let name_entry_clone = name_entry.clone();
+        let port_entry_clone = port_entry.clone();
+        let download_dir_clone = current_download_dir.clone();
+        let save_callbacks_clone = save_callbacks.clone();
+
+        save_btn.connect_clicked(move |_| {
+            let dev_name = name_entry_clone.text().to_string();
+            let port_str = port_entry_clone.text().to_string();
+            let port_val = port_str.trim().parse::<u16>().unwrap_or(8765);
+            let down_dir = download_dir_clone.borrow().clone();
+
+            let cfg = AppConfig {
+                device_name: if dev_name.trim().is_empty() {
+                    "Linux Quick Share".to_string()
+                } else {
+                    dev_name.trim().to_string()
+                },
+                download_dir: down_dir,
+                port: port_val,
+            };
+
+            if let Err(e) = cfg.save() {
+                tracing::error!("Failed to save settings to disk: {:?}", e);
+            } else {
+                tracing::info!("Settings successfully saved to {}", AppConfig::config_file_path().display());
+            }
+
+            for cb in save_callbacks_clone.borrow().iter() {
+                cb(cfg.clone());
+            }
+        });
 
         // ================= 2. Network & Service =================
         let network_group = adw::PreferencesGroup::new();
@@ -118,9 +183,15 @@ impl SettingsView {
             download_path_label,
             change_folder_btn,
             port_entry,
+            save_btn,
             ip_row,
             current_download_dir,
+            save_callbacks,
         }
+    }
+
+    pub fn on_save(&self, callback: impl Fn(AppConfig) + 'static) {
+        self.save_callbacks.borrow_mut().push(Box::new(callback));
     }
 
     pub fn get_device_name(&self) -> String {
@@ -131,6 +202,29 @@ impl SettingsView {
         let display = path.to_string_lossy().to_string();
         self.download_row.set_subtitle(&display);
         self.download_path_label.set_text(&display);
-        *self.current_download_dir.borrow_mut() = path;
+        *self.current_download_dir.borrow_mut() = path.clone();
+
+        // Automatically persist download directory change to disk
+        let dev_name = self.name_entry.text().to_string();
+        let port_val = self.port_entry.text().trim().parse::<u16>().unwrap_or(8765);
+        let cfg = AppConfig {
+            device_name: if dev_name.trim().is_empty() {
+                "Linux Quick Share".to_string()
+            } else {
+                dev_name.trim().to_string()
+            },
+            download_dir: path,
+            port: port_val,
+        };
+
+        if let Err(e) = cfg.save() {
+            tracing::error!("Failed to save updated download path: {:?}", e);
+        } else {
+            tracing::info!("Download path saved to {}", AppConfig::config_file_path().display());
+        }
+
+        for cb in self.save_callbacks.borrow().iter() {
+            cb(cfg.clone());
+        }
     }
 }

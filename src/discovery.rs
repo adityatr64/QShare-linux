@@ -43,14 +43,15 @@ impl MdnsAdvertiser {
 
         // 2. Build WifiLanServiceInfo byte buffer
         // In Google Nearby Connections / Quick Share specification:
-        // Service Name (Instance Name) = Base64([version_and_pcp (1), endpoint_id (4), service_id_hash (3)])
-        let version_and_pcp = 0x22u8; // Version 1, PCP 2 (P2P_STAR)
+        // Service Name (Instance Name) = Base64([version_and_pcp (1), endpoint_id (4), service_id_hash (3), 0x00, 0x00])
+        let version_and_pcp = 0x23u8; // Version 1, PCP 3 (P2P_STAR V2)
         let service_id_hash = [0xFCu8, 0x9Fu8, 0x5Eu8]; // SHA-256("NearbySharing")[0..3]
 
-        let mut instance_name_bytes = Vec::with_capacity(8);
+        let mut instance_name_bytes = Vec::with_capacity(10);
         instance_name_bytes.push(version_and_pcp);
         instance_name_bytes.extend_from_slice(endpoint_id.as_bytes());
         instance_name_bytes.extend_from_slice(&service_id_hash);
+        instance_name_bytes.extend_from_slice(&[0x00, 0x00]);
         let instance_name = URL_SAFE_NO_PAD.encode(&instance_name_bytes);
 
         // Header: (0 << 5) | (0 << 4) | (3 << 1) = 0x06 (V1, visible to everyone, Laptop device type)
@@ -59,7 +60,7 @@ impl MdnsAdvertiser {
         OsRng.fill_bytes(&mut salt);
 
         let dev_bytes = device_name.as_bytes();
-        let dev_len = dev_bytes.len().min(255) as u8;
+        let dev_len = dev_bytes.len().min(19) as u8; // Clamped to 19 bytes for stock Android compatibility
 
         let mut endpoint_info = Vec::with_capacity(1 + 16 + 1 + dev_len as usize);
         endpoint_info.push(header_byte);
@@ -143,7 +144,7 @@ impl MdnsBrowser {
         Ok(Self { daemon, receiver })
     }
 
-    pub async fn run_loop<F>(self, mut on_event: F)
+    pub async fn run_loop<F>(self, my_endpoint_id: Option<String>, mut on_event: F)
     where
         F: FnMut(AppEvent) + Send + 'static,
     {
@@ -181,6 +182,14 @@ impl MdnsBrowser {
                     let txt_n = info.get_property_val_str("n");
 
                     let (id, name, device_type) = parse_resolved_peer(instance_name, txt_n, &fullname);
+
+                    // Ignore own advertisement
+                    if let Some(ref my_id) = my_endpoint_id {
+                        if &id == my_id {
+                            debug!("Ignored self mDNS service: [{}]", id);
+                            continue;
+                        }
+                    }
 
                     known_peers.insert(fullname.clone(), id.clone());
 

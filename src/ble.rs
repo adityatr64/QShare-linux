@@ -1,60 +1,64 @@
-use crate::events::{AppEvent, DeviceType, DiscoveredPeer};
+use crate::events::AppEvent;
 use anyhow::Result;
-use std::collections::HashSet;
-use std::net::IpAddr;
-use std::process::Stdio;
+use rand::RngCore;
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
 pub struct BleAdvertiser {
     active: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 impl BleAdvertiser {
     pub fn new() -> Self {
         Self {
             active: Arc::new(AtomicBool::new(false)),
+            child: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn start_advertising(&self, endpoint_id: &str, device_name: &str) -> Result<()> {
         let ep_id = endpoint_id.to_string();
-        let name = device_name.to_string();
+        let _dev_name = device_name.to_string();
         let active = self.active.clone();
+        let child_arc = self.child.clone();
 
+        self.stop_advertising();
         active.store(true, Ordering::SeqCst);
 
         std::thread::spawn(move || {
-            info!("Initializing Bluetooth LE Advertiser for Quick Share (UUID: 0xFEF3)...");
+            info!("Initializing persistent Bluetooth LE Advertiser for Quick Share (UUIDs: 0xFE2C, 0xFEF3)...");
 
-            let dev_bytes = name.as_bytes();
-            let dev_len = dev_bytes.len().min(32) as u8;
+            // Ensure controller power is on
+            let _ = std::process::Command::new("bluetoothctl")
+                .args(["power", "on"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
 
-            let mut ep_info = Vec::with_capacity(1 + 16 + 1 + dev_len as usize);
-            ep_info.push(0x06u8); // Laptop, visible to everyone
-            ep_info.extend_from_slice(&[0x01u8; 16]); // 16-byte salt
-            ep_info.push(dev_len);
-            ep_info.extend_from_slice(&dev_bytes[..dev_len as usize]);
-
-            let mut adv_data = Vec::with_capacity(1 + 3 + 4 + 1 + ep_info.len());
-            adv_data.push(0x22u8);
-            adv_data.extend_from_slice(&[0xFC, 0x9F, 0x5E]);
-            adv_data.extend_from_slice(ep_id.as_bytes());
-            adv_data.push(ep_info.len() as u8);
-            adv_data.extend_from_slice(&ep_info);
-
-            let hex_payload = adv_data
+            let mut rand_bytes = [0u8; 10];
+            rand::rngs::OsRng.fill_bytes(&mut rand_bytes);
+            let rand_hex = rand_bytes
                 .iter()
                 .map(|b| format!("0x{:02x}", b))
                 .collect::<Vec<_>>()
                 .join(" ");
 
+            let ep_hex = ep_id
+                .as_bytes()
+                .iter()
+                .map(|b| format!("0x{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            // Google Fast Pair pulse (FE2C) + Quick Share Fast Beacon (FEF3)
             let script = format!(
-                "menu advertise\nclear\nuuids FEF3\nservice FEF3 {}\ndiscoverable on\nback\nadvertise on\nquit\n",
-                hex_payload
+                "menu advertise\nclear\nuuids FE2C FEF3\nservice FE2C 0xfc 0x12 0x8e 0x01 0x42 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 {}\nservice FEF3 0x23 {} 0xfc 0x9f 0x5e\ndiscoverable on\nback\nadvertise on\n",
+                rand_hex, ep_hex
             );
 
             let cmd = std::process::Command::new("bluetoothctl")
@@ -63,15 +67,22 @@ impl BleAdvertiser {
                 .stderr(Stdio::null())
                 .spawn();
 
-            if let Ok(mut child) = cmd {
-                if let Some(mut stdin) = child.stdin.take() {
-                    use std::io::Write;
-                    let _ = stdin.write_all(script.as_bytes());
+            match cmd {
+                Ok(mut proc) => {
+                    if let Some(stdin) = proc.stdin.as_mut() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(script.as_bytes());
+                        let _ = stdin.flush();
+                    }
+                    *child_arc.lock().unwrap() = Some(proc);
+                    info!(
+                        "Bluetooth LE Advertisement (0xFE2C / 0xFEF3) actively broadcasting with endpoint ID [{}]",
+                        ep_id
+                    );
                 }
-                let _ = child.wait();
-                info!("Bluetooth LE Advertisement (0xFEF3) registered successfully with endpoint ID [{}]", ep_id);
-            } else {
-                warn!("Failed to spawn bluetoothctl for BLE advertising");
+                Err(e) => {
+                    warn!("Failed to spawn bluetoothctl for persistent BLE advertising: {:?}", e);
+                }
             }
         });
 
@@ -81,21 +92,16 @@ impl BleAdvertiser {
     pub fn stop_advertising(&self) {
         if self.active.swap(false, Ordering::SeqCst) {
             info!("Stopping Bluetooth LE advertisement...");
-            std::thread::spawn(|| {
-                let script = "advertise off\nmenu advertise\nclear\nback\nquit\n";
-                let cmd = std::process::Command::new("bluetoothctl")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-                if let Ok(mut child) = cmd {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        use std::io::Write;
-                        let _ = stdin.write_all(script.as_bytes());
-                    }
-                    let _ = child.wait();
+            let mut lock = self.child.lock().unwrap();
+            if let Some(mut proc) = lock.take() {
+                if let Some(mut stdin) = proc.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(b"advertise off\nquit\n");
+                    let _ = stdin.flush();
                 }
-            });
+                let _ = proc.kill();
+                let _ = proc.wait();
+            }
         }
     }
 }
@@ -106,100 +112,89 @@ impl Drop for BleAdvertiser {
     }
 }
 
+use crate::discovery::get_local_ip;
+use crate::events::{DeviceType, DiscoveredPeer};
+use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
+
 pub struct BleScanner;
 
 impl BleScanner {
     pub async fn run_loop(ui_sender: UnboundedSender<AppEvent>) {
-        info!("Starting Bluetooth LE & Local LAN Peer Scanner...");
-        let mut discovered_ids: HashSet<String> = HashSet::new();
+        info!("Starting Bluetooth LE & Local LAN Background Scanner for Quick Share peers...");
+        let mut known_endpoints = HashSet::new();
+        let my_ip = get_local_ip();
 
+        let mut ble_cycle = 0;
         loop {
-            // 1. Check local ARP neighbor table for known active devices (e.g. WIZ_PHN at 192.168.1.7)
-            if let Ok(output) = tokio::process::Command::new("ip")
-                .arg("neigh")
-                .output()
-                .await
-            {
-                let text = String::from_utf8_lossy(&output.stdout);
-                for line in text.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 {
-                        let ip_str = parts[0];
-                        // Ignore router and localhost
-                        if ip_str.ends_with(".1") || ip_str.starts_with("fe80") {
-                            continue;
-                        }
-                        if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                            let peer_id = format!("lan_{}", ip_str.replace('.', "_"));
-                            if !discovered_ids.contains(&peer_id) {
-                                // Probe if port 8765 or 53317 is open
-                                let port = probe_quickshare_port(ip).await;
-                                if let Some(target_port) = port {
-                                    discovered_ids.insert(peer_id.clone());
-                                    // Query Bluetooth device alias if known
-                                    let name = lookup_peer_name(ip).await;
-                                    info!(
-                                        "Discovered Quick Share target on local network: '{}' at {}:{}",
-                                        name, ip, target_port
-                                    );
-                                    let _ = ui_sender.send(AppEvent::PeerDiscovered(DiscoveredPeer {
-                                        id: peer_id,
-                                        name,
-                                        device_type: DeviceType::Phone,
-                                        ip,
-                                        port: target_port,
-                                    }));
-                                }
-                            }
-                        }
+            // 1. Every ~15 seconds, trigger a quick BLE scan pulse in the background
+            if ble_cycle % 3 == 0 {
+                let _ = tokio::process::Command::new("bluetoothctl")
+                    .args(["--timeout", "2", "scan", "le"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+            ble_cycle += 1;
+
+            // 2. Scan ARP neighbors on local network
+            let neighbors = get_arp_neighbors();
+            for ip in neighbors {
+                if Some(ip) == my_ip || ip.is_loopback() {
+                    continue;
+                }
+
+                if let Some(port) = probe_quickshare_port(ip) {
+                    let ep_key = format!("{}:{}", ip, port);
+                    if known_endpoints.insert(ep_key.clone()) {
+                        info!(
+                            "Discovered nearby Quick Share device on LAN at {}:{}",
+                            ip, port
+                        );
+                        let peer = DiscoveredPeer {
+                            id: format!("lan_{}_{}", ip.to_string().replace('.', "_"), port),
+                            name: format!("Quick Share Device ({})", ip),
+                            device_type: DeviceType::Phone,
+                            ip,
+                            port,
+                        };
+                        let _ = ui_sender.send(AppEvent::PeerDiscovered(peer));
                     }
                 }
             }
 
-            // 2. Perform periodic BLE LE Discovery check via bluetoothctl
-            let _ = tokio::process::Command::new("bluetoothctl")
-                .args(["--timeout", "2", "scan", "le"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .await;
-
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(4)).await;
         }
     }
 }
 
-async fn probe_quickshare_port(ip: IpAddr) -> Option<u16> {
-    for port in [8765, 53317] {
-        if tokio::time::timeout(
-            Duration::from_millis(300),
-            tokio::net::TcpStream::connect((ip, port)),
-        )
-        .await
-        .is_ok()
-        {
+pub fn get_arp_neighbors() -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    if let Ok(content) = std::fs::read_to_string("/proc/net/arp") {
+        for line in content.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(ip_str) = parts.first() {
+                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                    // Filter out link-local and 0.0.0.0
+                    if !ip.is_unspecified() && !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
+                }
+            }
+        }
+    }
+    ips
+}
+
+pub fn probe_quickshare_port(ip: IpAddr) -> Option<u16> {
+    let candidate_ports = [53601, 53317, 8765, 53600, 53602, 53603];
+    for port in candidate_ports {
+        let addr = SocketAddr::new(ip, port);
+        if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(80)) {
+            drop(stream);
             return Some(port);
         }
     }
     None
 }
 
-async fn lookup_peer_name(ip: IpAddr) -> String {
-    // Check if paired bluetoothctl devices match
-    if let Ok(output) = tokio::process::Command::new("bluetoothctl")
-        .arg("devices")
-        .output()
-        .await
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            if line.contains("WIZ_PHN") || line.contains("Phone") || line.contains("Pixel") || line.contains("Galaxy") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    return parts[2..].join(" ");
-                }
-            }
-        }
-    }
-    format!("Device ({})", ip)
-}

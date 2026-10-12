@@ -8,4 +8,5 @@ pub mod sender;
 pub mod session;
 pub mod transport;
 pub mod ukey2;
+pub mod config;
 pub mod ui;

@@ -1,0 +1,15 @@
+[Unit]
+Description=QShare Linux Receiver Daemon
+Documentation=https://github.com/adityatr64/QShare-linux
+After=network.target sound.target avahi-daemon.service bluetooth.service
+Wants=avahi-daemon.service bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/QShare-linux --headless
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

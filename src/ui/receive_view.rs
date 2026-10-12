@@ -1,113 +1,25 @@
+use crate::events::DiscoveredPeer;
+use crate::ui::transfer_card::TransferCard;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
-
-#[derive(Clone)]
-pub struct TransferCard {
-    pub container: gtk::Box,
-    pub title_label: gtk::Label,
-    pub status_badge: gtk::Label,
-    pub progress_bar: gtk::ProgressBar,
-    pub stats_label: gtk::Label,
-}
-
-impl TransferCard {
-    pub fn new(filename: &str, total_bytes: u64, is_send: bool) -> Self {
-        let container = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        container.add_css_class("card");
-        container.set_margin_start(12);
-        container.set_margin_end(12);
-        container.set_margin_top(6);
-        container.set_margin_bottom(6);
-
-        // Header line: icon + filename + direction badge
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let icon_name = if is_send { "mail-send-symbolic" } else { "folder-download-symbolic" };
-        let icon = gtk::Image::from_icon_name(icon_name);
-        icon.set_icon_size(gtk::IconSize::Large);
-
-        let title_label = gtk::Label::new(Some(filename));
-        title_label.set_halign(gtk::Align::Start);
-        title_label.set_hexpand(true);
-        title_label.add_css_class("heading");
-
-        let status_text = if is_send { "Sending..." } else { "Receiving..." };
-        let status_badge = gtk::Label::new(Some(status_text));
-        status_badge.add_css_class("accent");
-
-        header.append(&icon);
-        header.append(&title_label);
-        header.append(&status_badge);
-
-        // Progress bar
-        let progress_bar = gtk::ProgressBar::new();
-        progress_bar.set_fraction(0.0);
-        progress_bar.set_hexpand(true);
-
-        // Stats line: bytes & speed
-        let total_mb = total_bytes as f64 / 1_048_576.0;
-        let stats_label = gtk::Label::new(Some(&format!("0.00 / {:.2} MB (0.0 MB/s)", total_mb)));
-        stats_label.set_halign(gtk::Align::Start);
-        stats_label.add_css_class("caption");
-
-        container.append(&header);
-        container.append(&progress_bar);
-        container.append(&stats_label);
-
-        Self {
-            container,
-            title_label,
-            status_badge,
-            progress_bar,
-            stats_label,
-        }
-    }
-
-    pub fn update(&self, transferred: u64, total: u64, speed_mbps: f64) {
-        let fraction = if total > 0 {
-            (transferred as f64 / total as f64).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        self.progress_bar.set_fraction(fraction);
-
-        let trans_mb = transferred as f64 / 1_048_576.0;
-        let total_mb = total as f64 / 1_048_576.0;
-        self.stats_label.set_text(&format!(
-            "{:.2} / {:.2} MB ({:.1} MB/s) — {:.0}%",
-            trans_mb,
-            total_mb,
-            speed_mbps,
-            fraction * 100.0
-        ));
-    }
-
-    pub fn complete(&self) {
-        self.progress_bar.set_fraction(1.0);
-        self.status_badge.set_text("Completed ✓");
-        self.status_badge.remove_css_class("accent");
-        self.status_badge.add_css_class("success");
-        self.stats_label.set_text("Transfer completed successfully");
-    }
-
-    pub fn fail(&self, err: &str) {
-        self.status_badge.set_text("Failed ✗");
-        self.status_badge.remove_css_class("accent");
-        self.status_badge.add_css_class("error");
-        self.stats_label.set_text(&format!("Error: {}", err));
-    }
-}
 
 pub struct ReceiveView {
     pub page: adw::PreferencesPage,
     pub visibility_switch: adw::SwitchRow,
+    pub peers_group: adw::PreferencesGroup,
+    pub peers_placeholder: adw::ActionRow,
+    pub discovered_peer_rows: Rc<RefCell<HashMap<String, (Rc<RefCell<DiscoveredPeer>>, adw::ActionRow)>>>,
     pub empty_placeholder: adw::StatusPage,
     pub transfers_box: gtk::Box,
     pub active_transfers: Rc<RefCell<HashMap<u64, TransferCard>>>,
+    pub send_peer_callbacks: Rc<RefCell<Vec<Box<dyn Fn(DiscoveredPeer) + 'static>>>>,
+    pub cancel_callbacks: Rc<RefCell<Vec<Box<dyn Fn(u64) + 'static>>>>,
 }
 
 impl ReceiveView {
@@ -136,8 +48,9 @@ impl ReceiveView {
         dev_row.add_prefix(&dev_icon);
         vis_group.add(&dev_row);
 
+        // Fixed: Use "and" instead of "&" to prevent Pango markup parsing warning
         let ep_row = adw::ActionRow::builder()
-            .title("Endpoint ID & Listening Address")
+            .title("Endpoint ID and Listening Address")
             .subtitle(&format!("ID: {} | {}:{}", endpoint_id, local_ip, port))
             .build();
         let ep_icon = gtk::Image::from_icon_name("network-wireless-symbolic");
@@ -146,9 +59,26 @@ impl ReceiveView {
 
         page.add(&vis_group);
 
-        // 2. Active / Recent Transfers Area
+        // 2. Discovered Nearby Devices Group
+        let peers_group = adw::PreferencesGroup::new();
+        peers_group.set_title("Discovered Nearby Devices");
+        peers_group.set_description(Some(
+            "Active Quick Share peers detected over Bluetooth LE and local network"
+        ));
+
+        let peers_placeholder = adw::ActionRow::builder()
+            .title("Scanning for nearby devices...")
+            .subtitle("Ensure your mobile device has Quick Share visible to Everyone")
+            .build();
+        let scan_icon = gtk::Image::from_icon_name("network-wireless-symbolic");
+        peers_placeholder.add_prefix(&scan_icon);
+        peers_group.add(&peers_placeholder);
+        page.add(&peers_group);
+
+        // 3. Active / Recent Transfers Area
         let trans_group = adw::PreferencesGroup::new();
         trans_group.set_title("Transfers");
+        trans_group.set_description(Some("Live transfer progress and transmission statistics"));
 
         let transfers_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
 
@@ -157,7 +87,7 @@ impl ReceiveView {
             .description("Open Quick Share or Nearby Share on your mobile device to transfer files directly to this PC")
             .icon_name("folder-download-symbolic")
             .build();
-        empty_placeholder.set_height_request(180);
+        empty_placeholder.set_height_request(160);
 
         trans_group.add(&empty_placeholder);
         trans_group.add(&transfers_box);
@@ -166,15 +96,137 @@ impl ReceiveView {
         Self {
             page,
             visibility_switch,
+            peers_group,
+            peers_placeholder,
+            discovered_peer_rows: Rc::new(RefCell::new(HashMap::new())),
             empty_placeholder,
             transfers_box,
             active_transfers: Rc::new(RefCell::new(HashMap::new())),
+            send_peer_callbacks: Rc::new(RefCell::new(Vec::new())),
+            cancel_callbacks: Rc::new(RefCell::new(Vec::new())),
         }
+    }
+
+    pub fn on_send_to_peer(&self, callback: impl Fn(DiscoveredPeer) + 'static) {
+        self.send_peer_callbacks.borrow_mut().push(Box::new(callback));
+    }
+
+    pub fn add_peer(&self, peer: DiscoveredPeer) {
+        let mut rows = self.discovered_peer_rows.borrow_mut();
+
+        // Deduplicate by ID or IP
+        let existing_key = rows.iter().find_map(|(id, (existing, _))| {
+            let cur = existing.borrow();
+            if id == &peer.id || cur.ip == peer.ip {
+                Some(id.clone())
+            } else {
+                None
+            }
+        });
+
+        if let Some(key) = existing_key {
+            if let Some((existing_rc, row)) = rows.remove(&key) {
+                let (final_name, final_type) = {
+                    let cur = existing_rc.borrow();
+                    let name = if peer.name.starts_with("Quick Share Device") && !cur.name.starts_with("Quick Share Device") {
+                        cur.name.clone()
+                    } else {
+                        peer.name.clone()
+                    };
+                    let dev_type = if peer.device_type == crate::events::DeviceType::Unknown && cur.device_type != crate::events::DeviceType::Unknown {
+                        cur.device_type
+                    } else {
+                        peer.device_type
+                    };
+                    (name, dev_type)
+                };
+                let mut updated_peer = peer.clone();
+                updated_peer.name = final_name;
+                updated_peer.device_type = final_type;
+
+                *existing_rc.borrow_mut() = updated_peer.clone();
+                row.set_title(&updated_peer.name);
+                row.set_subtitle(&format!(
+                    "{} • {}:{} [ID: {}]",
+                    updated_peer.device_type.display_name(),
+                    updated_peer.ip,
+                    updated_peer.port,
+                    updated_peer.id
+                ));
+                self.peers_placeholder.set_visible(false);
+                rows.insert(updated_peer.id.clone(), (existing_rc, row));
+                return;
+            }
+        }
+
+        self.peers_placeholder.set_visible(false);
+
+        let row = adw::ActionRow::builder()
+            .title(&peer.name)
+            .subtitle(&format!(
+                "{} • {}:{} [ID: {}]",
+                peer.device_type.display_name(),
+                peer.ip,
+                peer.port,
+                peer.id
+            ))
+            .build();
+
+        let icon = gtk::Image::from_icon_name(peer.device_type.icon_name());
+        icon.set_icon_size(gtk::IconSize::Large);
+        row.add_prefix(&icon);
+
+        let send_btn = gtk::Button::builder()
+            .label("Send Files")
+            .icon_name("mail-send-symbolic")
+            .valign(gtk::Align::Center)
+            .build();
+        send_btn.add_css_class("suggested-action");
+
+        let peer_rc = Rc::new(RefCell::new(peer.clone()));
+        let peer_rc_for_click = peer_rc.clone();
+        let callbacks = self.send_peer_callbacks.clone();
+        send_btn.connect_clicked(move |_| {
+            let current = peer_rc_for_click.borrow().clone();
+            for cb in callbacks.borrow().iter() {
+                cb(current.clone());
+            }
+        });
+
+        row.add_suffix(&send_btn);
+        row.set_activatable_widget(Some(&send_btn));
+        row.set_visible(true);
+
+        self.peers_group.add(&row);
+        rows.insert(peer.id.clone(), (peer_rc, row));
+    }
+
+    pub fn mark_peer_lost(&self, id: &str) {
+        let rows = self.discovered_peer_rows.borrow();
+        if let Some((peer_rc, row)) = rows.get(id) {
+            let peer = peer_rc.borrow();
+            row.set_subtitle(&format!(
+                "{} • {}:{} (Last seen nearby)",
+                peer.device_type.display_name(),
+                peer.ip,
+                peer.port
+            ));
+        }
+    }
+
+    pub fn on_cancel_transfer(&self, callback: impl Fn(u64) + 'static) {
+        self.cancel_callbacks.borrow_mut().push(Box::new(callback));
     }
 
     pub fn on_transfer_started(&self, id: u64, filename: &str, total: u64, is_send: bool) {
         self.empty_placeholder.set_visible(false);
         let card = TransferCard::new(filename, total, is_send);
+        let cancel_cbs = self.cancel_callbacks.clone();
+        card.on_cancel(move || {
+            for cb in cancel_cbs.borrow().iter() {
+                cb(id);
+            }
+        });
         self.transfers_box.prepend(&card.container);
         self.active_transfers.borrow_mut().insert(id, card);
     }
@@ -185,9 +237,9 @@ impl ReceiveView {
         }
     }
 
-    pub fn on_transfer_completed(&self, id: u64) {
+    pub fn on_transfer_completed(&self, id: u64, file_path: Option<PathBuf>) {
         if let Some(card) = self.active_transfers.borrow().get(&id) {
-            card.complete();
+            card.complete(file_path);
         }
     }
 

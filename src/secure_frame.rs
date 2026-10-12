@@ -103,7 +103,7 @@ pub fn encrypt_secure_frame(
         verification_key_id: None,
         decryption_key_id: None,
         iv: Some(iv.to_vec()),
-        public_metadata: None,
+        public_metadata: Some(vec![0x08, 0x0d, 0x10, 0x01]), // GcmMetadata: type=DEVICE_TO_DEVICE_MESSAGE (13), version=1
         associated_data_length: None,
     };
 

@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 use tokio::sync::oneshot;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DeviceType {
     Phone,
     Tablet,
@@ -16,6 +16,15 @@ impl DeviceType {
             DeviceType::Tablet => "tablet-symbolic",
             DeviceType::Laptop => "computer-symbolic",
             DeviceType::Unknown => "network-workgroup-symbolic",
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            DeviceType::Phone => "Phone",
+            DeviceType::Tablet => "Tablet",
+            DeviceType::Laptop => "Laptop",
+            DeviceType::Unknown => "Device",
         }
     }
 }
@@ -58,6 +67,7 @@ pub enum AppEvent {
     TransferCompleted {
         transfer_id: u64,
         filename: String,
+        file_path: Option<std::path::PathBuf>,
         is_send: bool,
     },
     TransferFailed {

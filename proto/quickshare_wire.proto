@@ -1,0 +1,471 @@
+syntax = "proto2";
+
+package quickshare;
+
+// ==============================================================================
+// UKEY2 & SecureMessage Protocols
+// ==============================================================================
+
+enum Ukey2HandshakeCipher {
+  RESERVED = 0;
+  P256_SHA512 = 100;
+  CURVE25519_SHA512 = 200;
+}
+
+message Ukey2Message {
+  enum Type {
+    UNKNOWN_DO_NOT_USE = 0;
+    ALERT = 1;
+    CLIENT_INIT = 2;
+    SERVER_INIT = 3;
+    CLIENT_FINISH = 4;
+  }
+  optional Type message_type = 1;
+  optional bytes message_data = 2;
+}
+
+message Ukey2Alert {
+  enum AlertType {
+    BAD_MESSAGE = 1;
+    BAD_MESSAGE_TYPE = 2;
+    INCORRECT_MESSAGE = 3;
+    BAD_MESSAGE_DATA = 4;
+    BAD_VERSION = 100;
+    BAD_RANDOM = 101;
+    BAD_HANDSHAKE_CIPHER = 102;
+    BAD_NEXT_PROTOCOL = 103;
+    BAD_PUBLIC_KEY = 104;
+    INTERNAL_ERROR = 200;
+  }
+  optional AlertType type = 1;
+  optional string error_message = 2;
+}
+
+message Ukey2ClientInit {
+  message CipherCommitment {
+    optional Ukey2HandshakeCipher handshake_cipher = 1;
+    optional bytes commitment = 2;
+  }
+  optional int32 version = 1;
+  optional bytes random = 2;
+  repeated CipherCommitment cipher_commitments = 3;
+  optional string next_protocol = 4;
+}
+
+message Ukey2ServerInit {
+  optional int32 version = 1;
+  optional bytes random = 2;
+  optional Ukey2HandshakeCipher handshake_cipher = 3;
+  optional bytes public_key = 4;
+}
+
+message Ukey2ClientFinished {
+  optional bytes public_key = 1;
+}
+
+enum PublicKeyType {
+  EC_P256 = 1;
+  RSA2048 = 2;
+  DH2048_MODP = 3;
+}
+
+message EcP256PublicKey {
+  optional bytes x = 1;
+  optional bytes y = 2;
+}
+
+message GenericPublicKey {
+  optional PublicKeyType type = 1;
+  optional EcP256PublicKey ec_p256_public_key = 2;
+}
+
+message DeviceToDeviceMessage {
+  optional bytes message = 1;
+  optional int32 sequence_number = 2;
+}
+
+message SecureMessage {
+  optional bytes header_and_body = 1;
+  optional bytes signature = 2;
+}
+
+message Header {
+  enum SigScheme {
+    HMAC_SHA256 = 1;
+  }
+  enum EncScheme {
+    NONE = 1;
+    AES_256_CBC = 2;
+  }
+  optional SigScheme signature_scheme = 1;
+  optional EncScheme encryption_scheme = 2;
+  optional bytes verification_key_id = 3;
+  optional bytes decryption_key_id = 4;
+  optional bytes iv = 5;
+  optional bytes public_metadata = 6;
+  optional uint32 associated_data_length = 7;
+}
+
+message HeaderAndBody {
+  optional Header header = 1;
+  optional bytes body = 2;
+}
+
+// ==============================================================================
+// Nearby Connections Framing Layer (OfflineWireFormats)
+// ==============================================================================
+
+message OfflineFrame {
+  enum Version {
+    UNKNOWN_VERSION = 0;
+    V1 = 1;
+  }
+  optional Version version = 1;
+  optional ConnectionsV1Frame v1 = 2;
+}
+
+message ConnectionsV1Frame {
+  enum FrameType {
+    UNKNOWN_FRAME_TYPE = 0;
+    CONNECTION_REQUEST = 1;
+    CONNECTION_RESPONSE = 2;
+    PAYLOAD_TRANSFER = 3;
+    BANDWIDTH_UPGRADE_NEGOTIATION = 4;
+    KEEP_ALIVE = 5;
+    DISCONNECTION = 6;
+    PAIRED_KEY_ENCRYPTION = 7;
+    AUTHENTICATION_MESSAGE = 8;
+    AUTHENTICATION_RESULT = 9;
+    AUTO_RESUME = 10;
+    AUTO_RECONNECT = 11;
+    BANDWIDTH_UPGRADE_RETRY = 12;
+  }
+  optional FrameType type = 1;
+  optional ConnectionRequestFrame connection_request = 2;
+  optional ConnectionResponseFrame connection_response = 3;
+  optional PayloadTransferFrame payload_transfer = 4;
+  optional BandwidthUpgradeNegotiationFrame bandwidth_upgrade_negotiation = 5;
+  optional KeepAliveFrame keep_alive = 6;
+  optional DisconnectionFrame disconnection = 7;
+  optional ConnectionsPairedKeyEncryptionFrame paired_key_encryption = 8;
+  optional AuthenticationMessageFrame authentication_message = 9;
+  optional AuthenticationResultFrame authentication_result = 10;
+}
+
+message ConnectionRequestFrame {
+  enum Medium {
+    UNKNOWN_MEDIUM = 0;
+    MDNS = 1;
+    BLUETOOTH = 2;
+    WIFI_HOTSPOT = 3;
+    BLE = 4;
+    WIFI_LAN = 5;
+    WIFI_AWARE = 6;
+    NFC = 7;
+    WIFI_DIRECT = 8;
+    WEB_RTC = 9;
+    BLE_L2CAP = 10;
+    USB = 11;
+    WEB_RTC_NON_CELLULAR = 12;
+    AWDL = 13;
+  }
+  enum ConnectionMode {
+    LEGACY = 0;
+    INSTANT = 1;
+  }
+  optional string endpoint_id = 1;
+  optional string endpoint_name = 2;
+  optional bytes handshake_data = 3;
+  optional int32 nonce = 4;
+  repeated Medium mediums = 5;
+  optional bytes endpoint_info = 6;
+  optional int32 keep_alive_interval_millis = 8;
+  optional int32 keep_alive_timeout_millis = 9;
+  optional int32 device_type = 10;
+  optional bytes device_info = 11;
+  optional ConnectionMode connection_mode = 14;
+}
+
+message OsInfo {
+  enum OsType {
+    UNKNOWN_OS_TYPE = 0;
+    ANDROID = 1;
+    CHROME_OS = 2;
+    WINDOWS = 3;
+    APPLE = 4;
+    LINUX = 100;
+  }
+  optional OsType type = 1;
+}
+
+message ConnectionResponseFrame {
+  enum ResponseStatus {
+    UNKNOWN_RESPONSE_STATUS = 0;
+    ACCEPT = 1;
+    REJECT = 2;
+  }
+  optional int32 status = 1;
+  optional bytes handshake_data = 2;
+  optional ResponseStatus response = 3;
+  optional OsInfo os_info = 4;
+  optional int32 multiplex_socket_bitmask = 5;
+  optional int32 nearby_connections_version = 6;
+  optional int32 safe_to_disconnect_version = 7;
+  optional int32 keep_alive_timeout_millis = 9;
+  optional string wifi_direct_device_name = 10;
+}
+
+message PayloadTransferFrame {
+  enum PacketType {
+    UNKNOWN_PACKET_TYPE = 0;
+    DATA = 1;
+    CONTROL = 2;
+    PAYLOAD_ACK = 3;
+  }
+  message PayloadHeader {
+    enum PayloadType {
+      UNKNOWN_PAYLOAD_TYPE = 0;
+      BYTES = 1;
+      FILE = 2;
+      STREAM = 3;
+    }
+    optional int64 id = 1;
+    optional PayloadType type = 2;
+    optional int64 total_size = 3;
+    optional bool is_sensitive = 4;
+    optional string file_name = 5;
+    optional string parent_folder = 6;
+    optional int64 last_modified_timestamp_millis = 7;
+  }
+  message PayloadChunk {
+    enum Flags {
+      LAST_CHUNK = 1;
+    }
+    optional int32 flags = 1;
+    optional int64 offset = 2;
+    optional bytes body = 3;
+    optional int32 index = 4;
+  }
+  message ControlMessage {
+    enum EventType {
+      UNKNOWN_EVENT_TYPE = 0;
+      PAYLOAD_ERROR = 1;
+      PAYLOAD_CANCELED = 2;
+      PAYLOAD_RECEIVED_ACK = 3;
+    }
+    optional EventType event = 1;
+    optional int64 offset = 2;
+  }
+  optional PacketType packet_type = 1;
+  optional PayloadHeader payload_header = 2;
+  optional PayloadChunk payload_chunk = 3;
+  optional ControlMessage control_message = 4;
+}
+
+message BandwidthUpgradeNegotiationFrame {
+  enum UpgradeStatus {
+    UNKNOWN_STATUS = 0;
+    SUCCESS = 1;
+    FAIL = 2;
+  }
+  optional UpgradeStatus status = 1;
+}
+
+message KeepAliveFrame {
+  optional bool ack = 1;
+}
+
+message DisconnectionFrame {
+  optional bool request_safe_to_disconnect = 1;
+  optional bool ack_safe_to_disconnect = 2;
+}
+
+message ConnectionsPairedKeyEncryptionFrame {
+  optional bytes signed_data = 1;
+  optional bytes secret_id_hash = 2;
+  optional bytes optional_signed_data = 3;
+}
+
+message AuthenticationMessageFrame {
+  optional bytes auth_token = 1;
+}
+
+message AuthenticationResultFrame {
+  enum Result {
+    UNKNOWN_RESULT = 0;
+    SUCCESS = 1;
+    FAILURE = 2;
+  }
+  optional Result result = 1;
+}
+
+// ==============================================================================
+// Quick Share Application Layer (Sharing Wire Format)
+// ==============================================================================
+
+message SharingFrame {
+  enum Version {
+    UNKNOWN_VERSION = 0;
+    V1 = 1;
+  }
+  optional Version version = 1;
+  optional SharingV1Frame v1 = 2;
+}
+
+message SharingV1Frame {
+  enum FrameType {
+    UNKNOWN_FRAME_TYPE = 0;
+    INTRODUCTION = 1;
+    RESPONSE = 2;
+    PAIRED_KEY_ENCRYPTION = 3;
+    PAIRED_KEY_RESULT = 4;
+    CERTIFICATE_INFO = 5;
+    CANCEL = 6;
+    PROGRESS_UPDATE = 7;
+    BINDINGS = 8;
+  }
+  optional FrameType type = 1;
+  optional IntroductionFrame introduction = 2;
+  optional SharingResponseFrame connection_response = 3;
+  optional PairedKeyEncryptionFrame paired_key_encryption = 4;
+  optional PairedKeyResultFrame paired_key_result = 5;
+  optional CertificateInfoFrame certificate_info = 6;
+  optional ProgressUpdateFrame progress_update = 7;
+}
+
+message FileMetadata {
+  enum Type {
+    UNKNOWN = 0;
+    IMAGE = 1;
+    VIDEO = 2;
+    ANDROID_APP = 3;
+    AUDIO = 4;
+    DOCUMENT = 5;
+    CONTACT_CARD = 6;
+  }
+  optional string name = 1;
+  optional Type type = 2;
+  optional int64 payload_id = 3;
+  optional int64 size = 4;
+  optional string mime_type = 5;
+  optional int64 id = 6;
+  optional string parent_folder = 7;
+  optional int64 attachment_hash = 8;
+  optional bool is_sensitive_content = 9;
+}
+
+message TextMetadata {
+  enum Type {
+    UNKNOWN = 0;
+    TEXT = 1;
+    URL = 2;
+    ADDRESS = 3;
+    PHONE_NUMBER = 4;
+  }
+  optional string text_title = 2;
+  optional Type type = 3;
+  optional int64 payload_id = 4;
+  optional int64 size = 5;
+  optional int64 id = 6;
+  optional bool is_sensitive_text = 7;
+}
+
+message WifiCredentialsMetadata {
+  enum SecurityType {
+    UNKNOWN_SECURITY_TYPE = 0;
+    OPEN = 1;
+    WPA_PSK = 2;
+    WEP = 3;
+    SAE = 4;
+  }
+  optional string ssid = 2;
+  optional SecurityType security_type = 3;
+  optional int64 payload_id = 4;
+  optional int64 id = 5;
+}
+
+message AppMetadata {
+  optional string app_name = 1;
+  optional int64 size = 2;
+  repeated int64 payload_id = 3;
+  optional int64 id = 4;
+  repeated string file_name = 5;
+  repeated int64 file_size = 6;
+  optional string package_name = 7;
+}
+
+message StreamMetadata {
+  optional string description = 1;
+  optional string package_name = 2;
+  optional int64 payload_id = 3;
+  optional string attributed_app_name = 4;
+}
+
+message IntroductionFrame {
+  enum SharingUseCase {
+    UNKNOWN = 0;
+    NEARBY_SHARE = 1;
+    REMOTE_COPY = 2;
+    TAP_TO_SHARE = 9;
+    FILE_SYNC = 10;
+  }
+  repeated FileMetadata file_metadata = 1;
+  repeated TextMetadata text_metadata = 2;
+  optional string required_package = 3;
+  repeated WifiCredentialsMetadata wifi_credentials_metadata = 4;
+  repeated AppMetadata app_metadata = 5;
+  optional bool start_transfer = 6;
+  repeated StreamMetadata stream_metadata = 7;
+  optional SharingUseCase use_case = 8;
+  repeated int64 preview_payload_ids = 9;
+  optional string transfer_id = 10;
+}
+
+message SharingResponseFrame {
+  enum Status {
+    UNKNOWN = 0;
+    ACCEPT = 1;
+    REJECT = 2;
+    NOT_ENOUGH_SPACE = 3;
+    UNSUPPORTED_ATTACHMENT_TYPE = 4;
+    TIMED_OUT = 5;
+  }
+  optional Status status = 1;
+}
+
+message ProgressUpdateFrame {
+  optional float progress = 1;
+  optional bool start_transfer = 2;
+}
+
+message PairedKeyEncryptionFrame {
+  optional bytes signed_data = 1;
+  optional bytes secret_id_hash = 2;
+  optional bytes optional_signed_data = 3;
+  optional bytes qr_code_handshake_data = 4;
+}
+
+message PairedKeyResultFrame {
+  enum Status {
+    UNKNOWN = 0;
+    SUCCESS = 1;
+    FAIL = 2;
+    UNABLE = 3;
+  }
+  optional Status status = 1;
+  optional int32 os_type = 2;
+}
+
+message CertificateInfoFrame {
+  repeated PublicCertificate public_certificate = 1;
+}
+
+message PublicCertificate {
+  optional bytes secret_id = 1;
+  optional bytes authenticity_key = 2;
+  optional bytes public_key = 3;
+  optional int64 start_time = 4;
+  optional int64 end_time = 5;
+  optional bytes encrypted_metadata_bytes = 6;
+  optional bytes metadata_encryption_key_tag = 7;
+}

@@ -52,17 +52,17 @@ where
         ));
     }
 
-    // Find Curve25519 commitment
+    // Find P256_SHA512 commitment
     let mut selected_commitment: Option<Vec<u8>> = None;
     for commitment in &client_init.cipher_commitments {
-        if commitment.handshake_cipher() == Ukey2HandshakeCipher::Curve25519Sha512 {
+        if commitment.handshake_cipher() == Ukey2HandshakeCipher::P256Sha512 {
             selected_commitment = commitment.commitment.clone();
             break;
         }
     }
 
     let expected_commitment = selected_commitment.ok_or_else(|| {
-        anyhow!("Client did not propose CURVE25519_SHA512 handshake cipher")
+        anyhow!("Client did not propose P256_SHA512 handshake cipher")
     })?;
 
     // 2. Generate ServerInit
@@ -70,11 +70,13 @@ where
     let mut server_random = vec![0u8; 32];
     OsRng.fill_bytes(&mut server_random);
 
+    let pub_key_bytes = kx.encode_public_key();
+
     let server_init = Ukey2ServerInit {
         version: Some(1),
-        random: Some(server_random.clone()),
-        handshake_cipher: Some(Ukey2HandshakeCipher::Curve25519Sha512 as i32),
-        public_key: Some(kx.public_key.as_bytes().to_vec()),
+        random: Some(server_random),
+        handshake_cipher: Some(Ukey2HandshakeCipher::P256Sha512 as i32),
+        public_key: Some(pub_key_bytes),
     };
 
     let mut server_init_bytes = Vec::new();
@@ -85,9 +87,9 @@ where
         message_data: Some(server_init_bytes),
     };
 
-    let mut msg2_bytes = Vec::new();
-    msg2.encode(&mut msg2_bytes)?;
-    write_length_prefixed_frame(stream, &msg2_bytes).await?;
+    let mut raw_msg2 = Vec::new();
+    msg2.encode(&mut raw_msg2)?;
+    write_length_prefixed_frame(stream, &raw_msg2).await?;
     debug!("Sent UKEY2 ServerInit (Message 2)");
 
     // 3. Read ClientFinish
@@ -102,16 +104,15 @@ where
         ));
     }
 
-    let client_finish_bytes = msg3
-        .message_data
-        .ok_or_else(|| anyhow!("UKEY2 Message 3 missing message_data"))?;
-
-    // Verify commitment: commitment == SHA512(client_finish_bytes)
-    let digest = sha512_digest(&client_finish_bytes);
+    // Verify commitment: commitment == SHA512(raw_msg3)
+    let digest = sha512_digest(&raw_msg3);
     if digest.as_slice() != expected_commitment.as_slice() {
         return Err(anyhow!("UKEY2 cipher commitment verification failed"));
     }
 
+    let client_finish_bytes = msg3
+        .message_data
+        .ok_or_else(|| anyhow!("UKEY2 Message 3 missing message_data"))?;
     let client_finish = Ukey2ClientFinished::decode(&client_finish_bytes[..])
         .map_err(|e| anyhow!("Failed to decode Ukey2ClientFinished: {:?}", e))?;
 
@@ -121,8 +122,8 @@ where
 
     let session_keys = kx.complete_server_exchange(
         &client_pub_bytes,
-        &client_random,
-        &server_random,
+        &raw_msg1,
+        &raw_msg2,
     )?;
 
     info!(
@@ -144,20 +145,28 @@ where
     OsRng.fill_bytes(&mut client_random);
 
     // Prepare ClientFinished ahead of time for commitment
+    let pub_key_bytes = kx.encode_public_key();
     let client_finished = Ukey2ClientFinished {
-        public_key: Some(kx.public_key.as_bytes().to_vec()),
+        public_key: Some(pub_key_bytes),
     };
     let mut client_finished_bytes = Vec::new();
     client_finished.encode(&mut client_finished_bytes)?;
 
-    let commitment = sha512_digest(&client_finished_bytes);
+    let msg3 = Ukey2Message {
+        message_type: Some(Ukey2Type::ClientFinish as i32),
+        message_data: Some(client_finished_bytes),
+    };
+    let mut raw_msg3 = Vec::new();
+    msg3.encode(&mut raw_msg3)?;
+
+    let commitment = sha512_digest(&raw_msg3);
 
     // 1. Send ClientInit
     let client_init = Ukey2ClientInit {
         version: Some(1),
-        random: Some(client_random.clone()),
+        random: Some(client_random),
         cipher_commitments: vec![CipherCommitment {
-            handshake_cipher: Some(Ukey2HandshakeCipher::Curve25519Sha512 as i32),
+            handshake_cipher: Some(Ukey2HandshakeCipher::P256Sha512 as i32),
             commitment: Some(commitment.to_vec()),
         }],
         next_protocol: Some("AES_256_CBC-HMAC_SHA256".to_string()),
@@ -169,9 +178,9 @@ where
         message_type: Some(Ukey2Type::ClientInit as i32),
         message_data: Some(client_init_bytes),
     };
-    let mut msg1_bytes = Vec::new();
-    msg1.encode(&mut msg1_bytes)?;
-    write_length_prefixed_frame(stream, &msg1_bytes).await?;
+    let mut raw_msg1 = Vec::new();
+    msg1.encode(&mut raw_msg1)?;
+    write_length_prefixed_frame(stream, &raw_msg1).await?;
     debug!("Sent UKEY2 ClientInit (Message 1)");
 
     // 2. Read ServerInit
@@ -192,27 +201,18 @@ where
     let server_init = Ukey2ServerInit::decode(&server_init_bytes[..])
         .map_err(|e| anyhow!("Failed to decode Ukey2ServerInit: {:?}", e))?;
 
-    let server_random = server_init
-        .random
-        .ok_or_else(|| anyhow!("ServerInit missing random"))?;
     let server_pub_bytes = server_init
         .public_key
         .ok_or_else(|| anyhow!("ServerInit missing public_key"))?;
 
     // 3. Send ClientFinish
-    let msg3 = Ukey2Message {
-        message_type: Some(Ukey2Type::ClientFinish as i32),
-        message_data: Some(client_finished_bytes),
-    };
-    let mut msg3_bytes = Vec::new();
-    msg3.encode(&mut msg3_bytes)?;
-    write_length_prefixed_frame(stream, &msg3_bytes).await?;
+    write_length_prefixed_frame(stream, &raw_msg3).await?;
     debug!("Sent UKEY2 ClientFinish (Message 3)");
 
     let session_keys = kx.complete_client_exchange(
         &server_pub_bytes,
-        &client_random,
-        &server_random,
+        &raw_msg1,
+        &raw_msg2,
     )?;
 
     info!(

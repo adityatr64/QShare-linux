@@ -1,5 +1,5 @@
-use quickshare_receiver::secure_frame::{decrypt_secure_frame, encrypt_secure_frame, ProtocolRole};
-use quickshare_receiver::ukey2::{perform_ukey2_handshake_client, perform_ukey2_handshake_server};
+use qshare_linux::secure_frame::{decrypt_secure_frame, encrypt_secure_frame, ProtocolRole};
+use qshare_linux::ukey2::{perform_ukey2_handshake_client, perform_ukey2_handshake_server};
 use tokio::io::duplex;
 
 #[tokio::test]
@@ -28,7 +28,7 @@ async fn test_end_to_end_ukey2_and_secure_channel() {
     println!("Mutual Verification PIN matched: [{}]", server_keys.pin);
 
     // 2. Encryption test: Client -> Server
-    let test_frame = quickshare_receiver::proto::wire::OfflineFrame {
+    let test_frame = qshare_linux::proto::wire::OfflineFrame {
         version: Some(1),
         v1: None,
     };
@@ -69,7 +69,7 @@ async fn test_end_to_end_ukey2_and_secure_channel() {
 
 #[tokio::test]
 async fn test_full_protocol_frame_exchange_flow() {
-    use quickshare_receiver::proto::wire::{
+    use qshare_linux::proto::wire::{
         connection_response_frame::ResponseStatus,
         connections_v1_frame::FrameType as ConnectionsFrameType,
         payload_transfer_frame::{
@@ -91,7 +91,7 @@ async fn test_full_protocol_frame_exchange_flow() {
             .expect("Server handshake failed");
 
         // 1. Read ConnectionRequest
-        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
+        let raw = qshare_linux::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
         let (req_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Server).unwrap();
         let v1 = req_frame.v1.unwrap();
         assert_eq!(v1.r#type(), ConnectionsFrameType::ConnectionRequest);
@@ -113,6 +113,7 @@ async fn test_full_protocol_frame_exchange_flow() {
                     safe_to_disconnect_version: None,
                     keep_alive_timeout_millis: Some(5000),
                     wifi_direct_device_name: None,
+                    os_info: None,
                 }),
                 payload_transfer: None,
                 bandwidth_upgrade_negotiation: None,
@@ -124,10 +125,10 @@ async fn test_full_protocol_frame_exchange_flow() {
             }),
         };
         let enc = encrypt_secure_frame(&keys, &resp, 0, ProtocolRole::Server).unwrap();
-        quickshare_receiver::transport::write_length_prefixed_frame(&mut server_stream, &enc).await.unwrap();
+        qshare_linux::transport::write_length_prefixed_frame(&mut server_stream, &enc).await.unwrap();
 
         // 2. Read PairedKeyEncryption
-        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
+        let raw = qshare_linux::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
         let (enc_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Server).unwrap();
         assert_eq!(enc_frame.v1.unwrap().r#type(), ConnectionsFrameType::PairedKeyEncryption);
 
@@ -152,10 +153,10 @@ async fn test_full_protocol_frame_exchange_flow() {
             }),
         };
         let enc2 = encrypt_secure_frame(&keys, &enc_resp, 1, ProtocolRole::Server).unwrap();
-        quickshare_receiver::transport::write_length_prefixed_frame(&mut server_stream, &enc2).await.unwrap();
+        qshare_linux::transport::write_length_prefixed_frame(&mut server_stream, &enc2).await.unwrap();
 
         // 3. Read IntroductionFrame
-        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
+        let raw = qshare_linux::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
         let (intro_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Server).unwrap();
         let intro_payload = intro_frame.v1.unwrap().payload_transfer.unwrap();
         let chunk_body = intro_payload.payload_chunk.unwrap().body.unwrap();
@@ -217,10 +218,10 @@ async fn test_full_protocol_frame_exchange_flow() {
             }),
         };
         let enc3 = encrypt_secure_frame(&keys, &accept_offline, 2, ProtocolRole::Server).unwrap();
-        quickshare_receiver::transport::write_length_prefixed_frame(&mut server_stream, &enc3).await.unwrap();
+        qshare_linux::transport::write_length_prefixed_frame(&mut server_stream, &enc3).await.unwrap();
 
         // 4. Read File Payload Chunk
-        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
+        let raw = qshare_linux::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
         let (file_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Server).unwrap();
         let chunk = file_frame.v1.unwrap().payload_transfer.unwrap().payload_chunk.unwrap();
         let received_body = chunk.body.unwrap();
@@ -264,10 +265,10 @@ async fn test_full_protocol_frame_exchange_flow() {
         };
         let enc = encrypt_secure_frame(&keys, &conn_req, seq, ProtocolRole::Client).unwrap();
         seq += 1;
-        quickshare_receiver::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
+        qshare_linux::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
 
         // Read ConnectionResponse
-        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut client_stream).await.unwrap();
+        let raw = qshare_linux::transport::read_length_prefixed_frame(&mut client_stream).await.unwrap();
         let (resp_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Client).unwrap();
         let resp = resp_frame.v1.unwrap().connection_response.unwrap();
         assert_eq!(resp.status, Some(ResponseStatus::Accept as i32));
@@ -294,10 +295,10 @@ async fn test_full_protocol_frame_exchange_flow() {
         };
         let enc = encrypt_secure_frame(&keys, &enc_req, seq, ProtocolRole::Client).unwrap();
         seq += 1;
-        quickshare_receiver::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
+        qshare_linux::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
 
         // Read PairedKeyEncryption Response
-        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut client_stream).await.unwrap();
+        let raw = qshare_linux::transport::read_length_prefixed_frame(&mut client_stream).await.unwrap();
         let (resp_enc, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Client).unwrap();
         assert_eq!(resp_enc.v1.unwrap().r#type(), ConnectionsFrameType::PairedKeyEncryption);
 
@@ -375,10 +376,10 @@ async fn test_full_protocol_frame_exchange_flow() {
         };
         let enc = encrypt_secure_frame(&keys, &intro_offline, seq, ProtocolRole::Client).unwrap();
         seq += 1;
-        quickshare_receiver::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
+        qshare_linux::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
 
         // Read SharingResponseFrame
-        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut client_stream).await.unwrap();
+        let raw = qshare_linux::transport::read_length_prefixed_frame(&mut client_stream).await.unwrap();
         let (sh_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Client).unwrap();
         let sh_bytes = sh_frame.v1.unwrap().payload_transfer.unwrap().payload_chunk.unwrap().body.unwrap();
         let decoded = SharingFrame::decode(&sh_bytes[..]).unwrap();
@@ -423,7 +424,7 @@ async fn test_full_protocol_frame_exchange_flow() {
             }),
         };
         let enc = encrypt_secure_frame(&keys, &data_offline, seq, ProtocolRole::Client).unwrap();
-        quickshare_receiver::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
+        qshare_linux::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
     });
 
     let (s_res, c_res) = tokio::join!(server_task, client_task);

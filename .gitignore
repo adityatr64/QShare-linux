@@ -1,1 +1,14 @@
-/target
+# Rust build artifacts
+/target/
+quickshare-receiver
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+*~
+
+# Logs and runtime artifacts
+*.log
+.system_generated/
