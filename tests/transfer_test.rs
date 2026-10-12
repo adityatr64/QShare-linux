@@ -1,0 +1,472 @@
+use quickshare_receiver::qr::QrConnectionInfo;
+use quickshare_receiver::secure_frame::{decrypt_secure_frame, encrypt_secure_frame, ProtocolRole};
+use quickshare_receiver::ukey2::{perform_ukey2_handshake_client, perform_ukey2_handshake_server};
+use std::net::IpAddr;
+use tokio::io::duplex;
+
+#[test]
+fn test_qr_roundtrip_and_parsing() {
+    let original = QrConnectionInfo {
+        ip: "192.168.1.120".parse().unwrap(),
+        port: 8765,
+        endpoint_id: "TEST".to_string(),
+        device_name: "Pixel 9 Pro".to_string(),
+    };
+
+    let uri = original.to_uri();
+    assert!(uri.starts_with("quickshare://192.168.1.120:8765/TEST?name=Pixel%209%20Pro"));
+
+    let parsed = QrConnectionInfo::parse(&uri).expect("Failed to parse URI");
+    assert_eq!(original, parsed);
+
+    // Test JSON format
+    let json = r#"{"ip":"10.0.0.5","port":9000,"id":"JSON","name":"Galaxy Tab"}"#;
+    let json_parsed = QrConnectionInfo::parse(json).expect("Failed to parse JSON");
+    assert_eq!(json_parsed.ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+    assert_eq!(json_parsed.port, 9000);
+    assert_eq!(json_parsed.endpoint_id, "JSON");
+    assert_eq!(json_parsed.device_name, "Galaxy Tab");
+
+    // Test plain IP:Port
+    let direct = "192.168.1.50:4444";
+    let direct_parsed = QrConnectionInfo::parse(direct).expect("Failed to parse direct ip:port");
+    assert_eq!(direct_parsed.ip, "192.168.1.50".parse::<IpAddr>().unwrap());
+    assert_eq!(direct_parsed.port, 4444);
+
+    // Test QR Pixbuf generation
+    let pixbuf = quickshare_receiver::qr::generate_qr_pixbuf(&original, 160);
+    assert!(pixbuf.is_ok());
+    let pb = pixbuf.unwrap();
+    assert!(pb.width() >= 160);
+    assert!(pb.height() >= 160);
+}
+
+#[tokio::test]
+async fn test_end_to_end_ukey2_and_secure_channel() {
+    let (mut client_stream, mut server_stream) = duplex(65536);
+
+    let server_task = tokio::spawn(async move {
+        perform_ukey2_handshake_server(&mut server_stream)
+            .await
+            .expect("Server handshake failed")
+    });
+
+    let client_task = tokio::spawn(async move {
+        perform_ukey2_handshake_client(&mut client_stream)
+            .await
+            .expect("Client handshake failed")
+    });
+
+    let (server_keys, client_keys) = tokio::join!(server_task, client_task);
+    let server_keys = server_keys.unwrap();
+    let client_keys = client_keys.unwrap();
+
+    // 1. Mutual 4-digit UKEY2 PIN must match exactly
+    assert_eq!(server_keys.pin, client_keys.pin);
+    assert_eq!(server_keys.pin.len(), 4);
+    println!("Mutual Verification PIN matched: [{}]", server_keys.pin);
+
+    // 2. Encryption test: Client -> Server
+    let test_frame = quickshare_receiver::proto::wire::OfflineFrame {
+        version: Some(1),
+        v1: None,
+    };
+
+    let encrypted_by_client = encrypt_secure_frame(
+        &client_keys,
+        &test_frame,
+        0,
+        ProtocolRole::Client,
+    ).expect("Client encryption failed");
+
+    let (decrypted_by_server, seq) = decrypt_secure_frame(
+        &server_keys,
+        &encrypted_by_client,
+        ProtocolRole::Server,
+    ).expect("Server decryption failed");
+
+    assert_eq!(seq, 0);
+    assert_eq!(decrypted_by_server.version, Some(1));
+
+    // 3. Encryption test: Server -> Client
+    let encrypted_by_server = encrypt_secure_frame(
+        &server_keys,
+        &test_frame,
+        42,
+        ProtocolRole::Server,
+    ).expect("Server encryption failed");
+
+    let (decrypted_by_client, seq2) = decrypt_secure_frame(
+        &client_keys,
+        &encrypted_by_server,
+        ProtocolRole::Client,
+    ).expect("Client decryption failed");
+
+    assert_eq!(seq2, 42);
+    assert_eq!(decrypted_by_client.version, Some(1));
+}
+
+#[tokio::test]
+async fn test_full_protocol_frame_exchange_flow() {
+    use quickshare_receiver::proto::wire::{
+        connection_response_frame::ResponseStatus,
+        connections_v1_frame::FrameType as ConnectionsFrameType,
+        payload_transfer_frame::{
+            payload_header::PayloadType, PayloadChunk, PayloadHeader, PacketType,
+        },
+        sharing_response_frame::Status as SharingResponseStatus,
+        sharing_v1_frame::FrameType as SharingFrameType,
+        ConnectionRequestFrame, ConnectionResponseFrame, ConnectionsPairedKeyEncryptionFrame,
+        ConnectionsV1Frame, FileMetadata, IntroductionFrame, OfflineFrame,
+        PayloadTransferFrame, SharingFrame, SharingResponseFrame, SharingV1Frame,
+    };
+    use prost::Message;
+
+    let (mut client_stream, mut server_stream) = duplex(65536);
+
+    let server_task = tokio::spawn(async move {
+        let keys = perform_ukey2_handshake_server(&mut server_stream)
+            .await
+            .expect("Server handshake failed");
+
+        // 1. Read ConnectionRequest
+        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
+        let (req_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Server).unwrap();
+        let v1 = req_frame.v1.unwrap();
+        assert_eq!(v1.r#type(), ConnectionsFrameType::ConnectionRequest);
+        let req = v1.connection_request.unwrap();
+        assert_eq!(req.endpoint_name.as_deref(), Some("Test Sender"));
+
+        // Send ConnectionResponse (ACCEPT)
+        let resp = OfflineFrame {
+            version: Some(1),
+            v1: Some(ConnectionsV1Frame {
+                r#type: Some(ConnectionsFrameType::ConnectionResponse as i32),
+                connection_request: None,
+                connection_response: Some(ConnectionResponseFrame {
+                    status: Some(ResponseStatus::Accept as i32),
+                    handshake_data: None,
+                    response: Some(ResponseStatus::Accept as i32),
+                    multiplex_socket_bitmask: None,
+                    nearby_connections_version: Some(1),
+                    safe_to_disconnect_version: None,
+                    keep_alive_timeout_millis: Some(5000),
+                    wifi_direct_device_name: None,
+                }),
+                payload_transfer: None,
+                bandwidth_upgrade_negotiation: None,
+                keep_alive: None,
+                disconnection: None,
+                paired_key_encryption: None,
+                authentication_message: None,
+                authentication_result: None,
+            }),
+        };
+        let enc = encrypt_secure_frame(&keys, &resp, 0, ProtocolRole::Server).unwrap();
+        quickshare_receiver::transport::write_length_prefixed_frame(&mut server_stream, &enc).await.unwrap();
+
+        // 2. Read PairedKeyEncryption
+        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
+        let (enc_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Server).unwrap();
+        assert_eq!(enc_frame.v1.unwrap().r#type(), ConnectionsFrameType::PairedKeyEncryption);
+
+        // Send PairedKeyEncryption response
+        let enc_resp = OfflineFrame {
+            version: Some(1),
+            v1: Some(ConnectionsV1Frame {
+                r#type: Some(ConnectionsFrameType::PairedKeyEncryption as i32),
+                connection_request: None,
+                connection_response: None,
+                payload_transfer: None,
+                bandwidth_upgrade_negotiation: None,
+                keep_alive: None,
+                disconnection: None,
+                paired_key_encryption: Some(ConnectionsPairedKeyEncryptionFrame {
+                    signed_data: Some(vec![1, 2, 3]),
+                    secret_id_hash: None,
+                    optional_signed_data: None,
+                }),
+                authentication_message: None,
+                authentication_result: None,
+            }),
+        };
+        let enc2 = encrypt_secure_frame(&keys, &enc_resp, 1, ProtocolRole::Server).unwrap();
+        quickshare_receiver::transport::write_length_prefixed_frame(&mut server_stream, &enc2).await.unwrap();
+
+        // 3. Read IntroductionFrame
+        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
+        let (intro_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Server).unwrap();
+        let intro_payload = intro_frame.v1.unwrap().payload_transfer.unwrap();
+        let chunk_body = intro_payload.payload_chunk.unwrap().body.unwrap();
+        let sharing_frame = SharingFrame::decode(&chunk_body[..]).unwrap();
+        let files = sharing_frame.v1.unwrap().introduction.unwrap().file_metadata;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name.as_deref(), Some("document.pdf"));
+
+        // Send SharingResponseFrame: ACCEPT
+        let accept_sharing = SharingFrame {
+            version: Some(1),
+            v1: Some(SharingV1Frame {
+                r#type: Some(SharingFrameType::Response as i32),
+                introduction: None,
+                connection_response: Some(SharingResponseFrame {
+                    status: Some(SharingResponseStatus::Accept as i32),
+                }),
+                paired_key_encryption: None,
+                paired_key_result: None,
+                certificate_info: None,
+                progress_update: None,
+            }),
+        };
+        let mut accept_bytes = Vec::new();
+        accept_sharing.encode(&mut accept_bytes).unwrap();
+
+        let accept_payload = PayloadTransferFrame {
+            packet_type: Some(PacketType::Data as i32),
+            payload_header: Some(PayloadHeader {
+                id: Some(999),
+                r#type: Some(PayloadType::Bytes as i32),
+                total_size: Some(accept_bytes.len() as i64),
+                is_sensitive: None,
+                file_name: None,
+                parent_folder: None,
+                last_modified_timestamp_millis: None,
+            }),
+            payload_chunk: Some(PayloadChunk {
+                flags: Some(1),
+                offset: Some(0),
+                body: Some(accept_bytes),
+                index: Some(0),
+            }),
+            control_message: None,
+        };
+        let accept_offline = OfflineFrame {
+            version: Some(1),
+            v1: Some(ConnectionsV1Frame {
+                r#type: Some(ConnectionsFrameType::PayloadTransfer as i32),
+                connection_request: None,
+                connection_response: None,
+                payload_transfer: Some(accept_payload),
+                bandwidth_upgrade_negotiation: None,
+                keep_alive: None,
+                disconnection: None,
+                paired_key_encryption: None,
+                authentication_message: None,
+                authentication_result: None,
+            }),
+        };
+        let enc3 = encrypt_secure_frame(&keys, &accept_offline, 2, ProtocolRole::Server).unwrap();
+        quickshare_receiver::transport::write_length_prefixed_frame(&mut server_stream, &enc3).await.unwrap();
+
+        // 4. Read File Payload Chunk
+        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut server_stream).await.unwrap();
+        let (file_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Server).unwrap();
+        let chunk = file_frame.v1.unwrap().payload_transfer.unwrap().payload_chunk.unwrap();
+        let received_body = chunk.body.unwrap();
+        assert_eq!(&received_body[..], b"Hello Quick Share from client!");
+    });
+
+    let client_task = tokio::spawn(async move {
+        let keys = perform_ukey2_handshake_client(&mut client_stream)
+            .await
+            .expect("Client handshake failed");
+
+        let mut seq = 0i32;
+
+        // 1. Send ConnectionRequest
+        let conn_req = OfflineFrame {
+            version: Some(1),
+            v1: Some(ConnectionsV1Frame {
+                r#type: Some(ConnectionsFrameType::ConnectionRequest as i32),
+                connection_request: Some(ConnectionRequestFrame {
+                    endpoint_id: Some("CLNT".to_string()),
+                    endpoint_name: Some("Test Sender".to_string()),
+                    handshake_data: None,
+                    nonce: None,
+                    mediums: vec![5],
+                    endpoint_info: Some(b"Test Sender".to_vec()),
+                    keep_alive_interval_millis: None,
+                    keep_alive_timeout_millis: Some(5000),
+                    device_type: Some(1),
+                    device_info: None,
+                    connection_mode: None,
+                }),
+                connection_response: None,
+                payload_transfer: None,
+                bandwidth_upgrade_negotiation: None,
+                keep_alive: None,
+                disconnection: None,
+                paired_key_encryption: None,
+                authentication_message: None,
+                authentication_result: None,
+            }),
+        };
+        let enc = encrypt_secure_frame(&keys, &conn_req, seq, ProtocolRole::Client).unwrap();
+        seq += 1;
+        quickshare_receiver::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
+
+        // Read ConnectionResponse
+        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut client_stream).await.unwrap();
+        let (resp_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Client).unwrap();
+        let resp = resp_frame.v1.unwrap().connection_response.unwrap();
+        assert_eq!(resp.status, Some(ResponseStatus::Accept as i32));
+
+        // 2. Send PairedKeyEncryption
+        let enc_req = OfflineFrame {
+            version: Some(1),
+            v1: Some(ConnectionsV1Frame {
+                r#type: Some(ConnectionsFrameType::PairedKeyEncryption as i32),
+                connection_request: None,
+                connection_response: None,
+                payload_transfer: None,
+                bandwidth_upgrade_negotiation: None,
+                keep_alive: None,
+                disconnection: None,
+                paired_key_encryption: Some(ConnectionsPairedKeyEncryptionFrame {
+                    signed_data: Some(vec![1, 2, 3]),
+                    secret_id_hash: None,
+                    optional_signed_data: None,
+                }),
+                authentication_message: None,
+                authentication_result: None,
+            }),
+        };
+        let enc = encrypt_secure_frame(&keys, &enc_req, seq, ProtocolRole::Client).unwrap();
+        seq += 1;
+        quickshare_receiver::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
+
+        // Read PairedKeyEncryption Response
+        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut client_stream).await.unwrap();
+        let (resp_enc, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Client).unwrap();
+        assert_eq!(resp_enc.v1.unwrap().r#type(), ConnectionsFrameType::PairedKeyEncryption);
+
+        // 3. Send IntroductionFrame
+        let intro = IntroductionFrame {
+            file_metadata: vec![FileMetadata {
+                name: Some("document.pdf".to_string()),
+                r#type: Some(1),
+                payload_id: Some(12345),
+                size: Some(30),
+                mime_type: Some("application/pdf".to_string()),
+                id: Some(101),
+                parent_folder: None,
+                attachment_hash: None,
+                is_sensitive_content: None,
+            }],
+            text_metadata: Vec::new(),
+            required_package: None,
+            wifi_credentials_metadata: Vec::new(),
+            app_metadata: Vec::new(),
+            start_transfer: Some(true),
+            stream_metadata: Vec::new(),
+            use_case: None,
+            preview_payload_ids: Vec::new(),
+            transfer_id: None,
+        };
+        let sharing = SharingFrame {
+            version: Some(1),
+            v1: Some(SharingV1Frame {
+                r#type: Some(SharingFrameType::Introduction as i32),
+                introduction: Some(intro),
+                connection_response: None,
+                paired_key_encryption: None,
+                paired_key_result: None,
+                certificate_info: None,
+                progress_update: None,
+            }),
+        };
+        let mut sharing_bytes = Vec::new();
+        sharing.encode(&mut sharing_bytes).unwrap();
+
+        let intro_payload = PayloadTransferFrame {
+            packet_type: Some(PacketType::Data as i32),
+            payload_header: Some(PayloadHeader {
+                id: Some(111),
+                r#type: Some(PayloadType::Bytes as i32),
+                total_size: Some(sharing_bytes.len() as i64),
+                is_sensitive: None,
+                file_name: None,
+                parent_folder: None,
+                last_modified_timestamp_millis: None,
+            }),
+            payload_chunk: Some(PayloadChunk {
+                flags: Some(1),
+                offset: Some(0),
+                body: Some(sharing_bytes),
+                index: Some(0),
+            }),
+            control_message: None,
+        };
+        let intro_offline = OfflineFrame {
+            version: Some(1),
+            v1: Some(ConnectionsV1Frame {
+                r#type: Some(ConnectionsFrameType::PayloadTransfer as i32),
+                connection_request: None,
+                connection_response: None,
+                payload_transfer: Some(intro_payload),
+                bandwidth_upgrade_negotiation: None,
+                keep_alive: None,
+                disconnection: None,
+                paired_key_encryption: None,
+                authentication_message: None,
+                authentication_result: None,
+            }),
+        };
+        let enc = encrypt_secure_frame(&keys, &intro_offline, seq, ProtocolRole::Client).unwrap();
+        seq += 1;
+        quickshare_receiver::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
+
+        // Read SharingResponseFrame
+        let raw = quickshare_receiver::transport::read_length_prefixed_frame(&mut client_stream).await.unwrap();
+        let (sh_frame, _) = decrypt_secure_frame(&keys, &raw, ProtocolRole::Client).unwrap();
+        let sh_bytes = sh_frame.v1.unwrap().payload_transfer.unwrap().payload_chunk.unwrap().body.unwrap();
+        let decoded = SharingFrame::decode(&sh_bytes[..]).unwrap();
+        assert_eq!(
+            decoded.v1.unwrap().connection_response.unwrap().status,
+            Some(SharingResponseStatus::Accept as i32)
+        );
+
+        // 4. Send File Data Chunk
+        let data_payload = PayloadTransferFrame {
+            packet_type: Some(PacketType::Data as i32),
+            payload_header: Some(PayloadHeader {
+                id: Some(12345),
+                r#type: Some(PayloadType::File as i32),
+                total_size: Some(30),
+                is_sensitive: None,
+                file_name: Some("document.pdf".to_string()),
+                parent_folder: None,
+                last_modified_timestamp_millis: None,
+            }),
+            payload_chunk: Some(PayloadChunk {
+                flags: Some(1),
+                offset: Some(0),
+                body: Some(b"Hello Quick Share from client!".to_vec()),
+                index: Some(0),
+            }),
+            control_message: None,
+        };
+        let data_offline = OfflineFrame {
+            version: Some(1),
+            v1: Some(ConnectionsV1Frame {
+                r#type: Some(ConnectionsFrameType::PayloadTransfer as i32),
+                connection_request: None,
+                connection_response: None,
+                payload_transfer: Some(data_payload),
+                bandwidth_upgrade_negotiation: None,
+                keep_alive: None,
+                disconnection: None,
+                paired_key_encryption: None,
+                authentication_message: None,
+                authentication_result: None,
+            }),
+        };
+        let enc = encrypt_secure_frame(&keys, &data_offline, seq, ProtocolRole::Client).unwrap();
+        quickshare_receiver::transport::write_length_prefixed_frame(&mut client_stream, &enc).await.unwrap();
+    });
+
+    let (s_res, c_res) = tokio::join!(server_task, client_task);
+    s_res.unwrap();
+    c_res.unwrap();
+}
+

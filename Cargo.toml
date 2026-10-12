@@ -1,0 +1,48 @@
+[package]
+name = "quickshare-receiver"
+version = "0.2.0"
+edition = "2021"
+authors = ["QuickShare Systems & RE Specialist"]
+description = "Native Libadwaita desktop client and receiver daemon for Google Quick Share"
+
+[dependencies]
+# UI Toolkit
+libadwaita = { version = "0.7", features = ["v1_4"] }
+gtk4 = { version = "0.9", features = ["v4_6"] }
+glib = "0.20"
+gio = "0.20"
+gdk-pixbuf = "0.20"
+
+# QR Code
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Async runtime & networking
+tokio = { version = "1", features = ["full"] }
+mdns-sd = "0.21"
+
+# Protobuf
+prost = "0.13"
+prost-types = "0.13"
+
+# Cryptography & Security
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+aes = "0.8"
+cbc = "0.1"
+cipher = { version = "0.4", features = ["block-padding"] }
+
+# Utilities
+base64 = "0.22"
+rand = "0.8"
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5.0"
+
+[build-dependencies]
+prost-build = "0.13"
