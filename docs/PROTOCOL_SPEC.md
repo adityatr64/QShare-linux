@@ -37,7 +37,7 @@ The Quick Share protocol operates across four distinct abstraction layers:
 ### 2.1 Service String Derivation
 Quick Share on local Wi-Fi / LAN announces itself via DNS-SD (RFC 6763) over Multicast DNS (RFC 6762).
 The service type is:
-$$\text{service\_type} = \text{"\_" + SHA256("NearbySharing")[0..6].hex() + ".\_tcp"}$$
+$$\text{service\textunderscore type} = \text{"\textunderscore" + SHA256("NearbySharing")[0..6].hex() + ".\textunderscore tcp"}$$
 
 - Canonical Service ID string: `"NearbySharing"`
 - Full SHA-256 Digest: `fc9f5ed42c8a5e9ec25f20f02377bcf4d1f21eb798059ffca666e1d52033c461`
@@ -129,16 +129,16 @@ Client (Sender)                               Server (Linux Receiver)
 
 ### 4.2 Key Derivation Pipeline
 1. **Diffie-Hellman Exchange**:
-   $$\text{shared\_secret} = \text{X25519}(\text{server\_private\_key}, \text{client\_public\_key}) \quad (32 \text{ bytes})$$
+   $$\text{shared\textunderscore secret} = \text{X25519}(\text{server\textunderscore private\textunderscore key}, \text{client\textunderscore public\textunderscore key}) \quad (32 \text{ bytes})$$
 
 2. **Handshake PRK (Pseudo-Random Key)**:
-   $$\text{PRK} = \text{HKDF-Extract}(\text{salt}=\text{client\_random} \parallel \text{server\_random}, \text{IKM}=\text{shared\_secret})$$
+   $$\text{PRK} = \text{HKDF-Extract}(\text{salt}=\text{client\textunderscore random} \parallel \text{server\textunderscore random}, \text{IKM}=\text{shared\textunderscore secret})$$
 
 3. **Authentication Token**:
-   $$\text{auth\_token} = \text{HKDF-Expand}(\text{PRK}, \text{info}=\text{"UKEY2 v1 auth"}, \text{len}=32)$$
+   $$\text{auth\textunderscore token} = \text{HKDF-Expand}(\text{PRK}, \text{info}=\text{"UKEY2 v1 auth"}, \text{len}=32)$$
 
 4. **Next Protocol Secret**:
-   $$\text{next\_secret} = \text{HKDF-Expand}(\text{PRK}, \text{info}=\text{"UKEY2 v1 next"}, \text{len}=32)$$
+   $$\text{next\textunderscore secret} = \text{HKDF-Expand}(\text{PRK}, \text{info}=\text{"UKEY2 v1 next"}, \text{len}=32)$$
 
 5. **Session Encryption Keys**:
    Using `HKDF-Expand` with `next_secret` and info strings:
