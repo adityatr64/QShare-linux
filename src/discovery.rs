@@ -42,8 +42,16 @@ impl MdnsAdvertiser {
             .collect();
 
         // 2. Build WifiLanServiceInfo byte buffer
-        let version_and_pcp = 0x22u8; // Version 1, PCP 2
+        // In Google Nearby Connections / Quick Share specification:
+        // Service Name (Instance Name) = Base64([version_and_pcp (1), endpoint_id (4), service_id_hash (3)])
+        let version_and_pcp = 0x22u8; // Version 1, PCP 2 (P2P_STAR)
         let service_id_hash = [0xFCu8, 0x9Fu8, 0x5Eu8]; // SHA-256("NearbySharing")[0..3]
+
+        let mut instance_name_bytes = Vec::with_capacity(8);
+        instance_name_bytes.push(version_and_pcp);
+        instance_name_bytes.extend_from_slice(endpoint_id.as_bytes());
+        instance_name_bytes.extend_from_slice(&service_id_hash);
+        let instance_name = URL_SAFE_NO_PAD.encode(&instance_name_bytes);
 
         // Header: (0 << 5) | (0 << 4) | (3 << 1) = 0x06 (V1, visible to everyone, Laptop device type)
         let header_byte = 0x06u8;
@@ -59,19 +67,11 @@ impl MdnsAdvertiser {
         endpoint_info.push(dev_len);
         endpoint_info.extend_from_slice(&dev_bytes[..dev_len as usize]);
 
-        let mut service_info_bytes = Vec::with_capacity(9 + endpoint_info.len());
-        service_info_bytes.push(version_and_pcp);
-        service_info_bytes.extend_from_slice(endpoint_id.as_bytes());
-        service_info_bytes.extend_from_slice(&service_id_hash);
-        service_info_bytes.push(endpoint_info.len() as u8);
-        service_info_bytes.extend_from_slice(&endpoint_info);
+        let encoded_endpoint_info = URL_SAFE_NO_PAD.encode(&endpoint_info);
 
-        // 3. Base64 URL-safe encode
-        let encoded_service_name = URL_SAFE_NO_PAD.encode(&service_info_bytes);
-
-        // 4. TXT record
+        // 3. TXT record: "n" contains base64 endpoint_info
         let mut properties = HashMap::new();
-        properties.insert("n".to_string(), encoded_service_name.clone());
+        properties.insert("n".to_string(), encoded_endpoint_info.clone());
 
         // Resolve host IP
         let host_name = format!("{}.local.", endpoint_id);
@@ -81,14 +81,15 @@ impl MdnsAdvertiser {
         };
 
         info!("Registering mDNS Service: [{}] on port {}", QUICKSHARE_SERVICE_TYPE, port);
-        info!("  Endpoint ID: {}", endpoint_id);
-        info!("  Device Name: {}", device_name);
-        info!("  TXT (n):     {}", encoded_service_name);
-        info!("  IP Address:  {}", my_ip);
+        info!("  Endpoint ID:   {}", endpoint_id);
+        info!("  Instance Name: {}", instance_name);
+        info!("  Device Name:   {}", device_name);
+        info!("  TXT (n):       {}", encoded_endpoint_info);
+        info!("  IP Address:    {}", my_ip);
 
         let service = ServiceInfo::new(
             QUICKSHARE_SERVICE_TYPE,
-            &encoded_service_name,
+            &instance_name,
             &host_name,
             my_ip,
             port,
@@ -171,17 +172,17 @@ impl MdnsBrowser {
                         }
                     };
 
-                    // Decode TXT 'n' record
-                    let txt_n = info.get_property_val_str("n");
-                    let (id, name, device_type) = if let Some(n_val) = txt_n {
-                        parse_nearby_service_info(n_val).unwrap_or_else(|| {
-                            fallback_peer_info(&fullname)
-                        })
-                    } else {
-                        fallback_peer_info(&fullname)
-                    };
+                    // Extract instance name from fullname (first label before ._FC9F5ED42C8A)
+                    let instance_name = fullname
+                        .split('.')
+                        .next()
+                        .unwrap_or("");
 
-                    known_peers.insert(fullname, id.clone());
+                    let txt_n = info.get_property_val_str("n");
+
+                    let (id, name, device_type) = parse_resolved_peer(instance_name, txt_n, &fullname);
+
+                    known_peers.insert(fullname.clone(), id.clone());
 
                     info!(
                         "Discovered Quick Share peer: '{}' ({:?}) at {}:{} [ID: {}]",
@@ -211,38 +212,78 @@ impl MdnsBrowser {
     }
 }
 
-pub fn parse_nearby_service_info(base64_str: &str) -> Option<(String, String, DeviceType)> {
-    let bytes = URL_SAFE_NO_PAD.decode(base64_str.as_bytes()).ok()?;
-    if bytes.len() < 9 {
-        return None;
-    }
+pub fn parse_resolved_peer(
+    instance_name: &str,
+    txt_n: Option<&str>,
+    _fullname: &str,
+) -> (String, String, DeviceType) {
+    let mut ep_id = String::new();
+    let mut dev_name = String::new();
+    let mut dev_type = DeviceType::Unknown;
 
-    let endpoint_id = String::from_utf8_lossy(&bytes[1..5]).to_string();
-    let info_len = bytes[8] as usize;
-
-    if bytes.len() >= 9 + info_len && info_len >= 18 {
-        let ep_info = &bytes[9..9 + info_len];
-        let header = ep_info[0];
-        let raw_type = (header >> 1) & 0x07;
-        let device_type = match raw_type {
-            1 => DeviceType::Phone,
-            2 => DeviceType::Tablet,
-            3 => DeviceType::Laptop,
-            _ => DeviceType::Unknown,
-        };
-        let name_len = ep_info[17] as usize;
-        if ep_info.len() >= 18 + name_len {
-            let name = String::from_utf8_lossy(&ep_info[18..18 + name_len]).to_string();
-            return Some((endpoint_id, name, device_type));
+    // 1. Try to extract endpoint ID from instance name (8-byte base64 URL safe: [version, id[4], hash[3]])
+    if let Ok(inst_bytes) = URL_SAFE_NO_PAD.decode(instance_name.as_bytes()) {
+        if inst_bytes.len() >= 5 {
+            ep_id = String::from_utf8_lossy(&inst_bytes[1..5]).to_string();
         }
     }
 
-    Some((endpoint_id.clone(), format!("Device {}", endpoint_id), DeviceType::Unknown))
-}
+    // 2. Try to decode TXT record 'n'
+    if let Some(n_val) = txt_n {
+        if let Ok(n_bytes) = URL_SAFE_NO_PAD.decode(n_val.as_bytes()) {
+            // Case A: Standard endpoint_info: [header(1), salt(16), name_len(1), name...]
+            if n_bytes.len() >= 18 {
+                let header = n_bytes[0];
+                let raw_type = (header >> 1) & 0x07;
+                dev_type = match raw_type {
+                    1 => DeviceType::Phone,
+                    2 => DeviceType::Tablet,
+                    3 => DeviceType::Laptop,
+                    _ => DeviceType::Unknown,
+                };
+                let name_len = n_bytes[17] as usize;
+                if n_bytes.len() >= 18 + name_len {
+                    dev_name = String::from_utf8_lossy(&n_bytes[18..18 + name_len]).to_string();
+                }
+            }
 
-fn fallback_peer_info(fullname: &str) -> (String, String, DeviceType) {
-    let id: String = fullname.chars().take(8).collect();
-    (id.clone(), format!("QuickShare ({})", id), DeviceType::Unknown)
+            // Case B: Combined format: [version(1), ep_id(4), hash(3), len(1), endpoint_info...]
+            if dev_name.is_empty() && n_bytes.len() >= 9 {
+                if ep_id.is_empty() {
+                    ep_id = String::from_utf8_lossy(&n_bytes[1..5]).to_string();
+                }
+                let info_len = n_bytes[8] as usize;
+                if n_bytes.len() >= 9 + info_len && info_len >= 18 {
+                    let ep_info = &n_bytes[9..9 + info_len];
+                    let header = ep_info[0];
+                    let raw_type = (header >> 1) & 0x07;
+                    dev_type = match raw_type {
+                        1 => DeviceType::Phone,
+                        2 => DeviceType::Tablet,
+                        3 => DeviceType::Laptop,
+                        _ => DeviceType::Unknown,
+                    };
+                    let name_len = ep_info[17] as usize;
+                    if ep_info.len() >= 18 + name_len {
+                        dev_name = String::from_utf8_lossy(&ep_info[18..18 + name_len]).to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    if ep_id.is_empty() {
+        ep_id = instance_name.chars().take(4).collect();
+        if ep_id.is_empty() {
+            ep_id = "PEER".to_string();
+        }
+    }
+
+    if dev_name.is_empty() {
+        dev_name = format!("Quick Share Device ({})", ep_id);
+    }
+
+    (ep_id, dev_name, dev_type)
 }
 
 pub fn get_local_ip() -> Option<IpAddr> {

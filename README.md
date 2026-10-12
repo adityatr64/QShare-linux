@@ -1,6 +1,6 @@
 # Quick Share Native Desktop Client & Receiver
 
-An interoperable, native Linux desktop application and receiver daemon for **Google Quick Share / Nearby Share**, built in Rust with **GTK4 / Libadwaita**, async **Tokio**, bidirectional file transfers, UKEY2 security handshake, QR code direct pairing, and mDNS discovery.
+An interoperable, native Linux desktop application and receiver daemon for **Google Quick Share / Nearby Share**, built in Rust with **GTK4 / Libadwaita**, async **Tokio**, bidirectional file transfers, UKEY2 security handshake, Bluetooth LE discovery, and mDNS.
 
 ---
 
@@ -22,9 +22,10 @@ An interoperable, native Linux desktop application and receiver daemon for **Goo
      * Dynamic list of discovered nearby targets with device type icons (`phone-symbolic`, `tablet-symbolic`, `computer-symbolic`).
      * Direct **"Send"** trigger streaming 64 KB chunks over encrypted transport upon peer acceptance.
 
-3. **QR Code Direct Pairing**:
-   - **Receive Tab**: Displays a QR Code presentation tile containing the direct connection bootstrap URI (`quickshare://<ip>:<port>/<id>?name=<name>`), allowing peers to connect without relying on mDNS. Includes a "Copy Direct Pairing Link" button.
-   - **Send Tab**: Features a **"Connect via QR / Direct IP"** dialog allowing manual entry of a `quickshare://` URI, JSON payload, or `IP:Port`.
+3. **Bluetooth LE & Wi-Fi LAN Discovery**:
+   - **Bluetooth LE Advertisement (`0xFEF3`)**: Implements the official Google Nearby Connections BLE beacon carrying the 4-byte endpoint ID, service ID hash (`[0xFC, 0x9F, 0x5E]`), and device metadata. This allows Android phones to detect the Linux workstation in their Quick Share share sheet immediately without scanning Wi-Fi continuously.
+   - **DNS-SD / mDNS Registration**: Broadcasts `_FC9F5ED42C8A._tcp.local.` with RFC-compliant 8-byte base64 instance name and `n=<endpoint_info>` TXT record matching Android's `WifiLanServiceInfo` parser.
+   - **Active Peer Discovery**: Scans both Bluetooth LE and local subnet neighbors (`ip neigh`) for active Quick Share targets.
 
 4. **Cryptographic Integrity & Security**:
    - **UKEY2 Key Exchange**: Curve25519 Diffie-Hellman + SHA-512 commitment.

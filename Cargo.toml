@@ -13,9 +13,6 @@ glib = "0.20"
 gio = "0.20"
 gdk-pixbuf = "0.20"
 
-# QR Code
-qrcode = "0.14"
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Async runtime & networking
 tokio = { version = "1", features = ["full"] }

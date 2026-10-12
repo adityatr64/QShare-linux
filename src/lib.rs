@@ -2,7 +2,7 @@ pub mod crypto;
 pub mod discovery;
 pub mod events;
 pub mod proto;
-pub mod qr;
+pub mod ble;
 pub mod secure_frame;
 pub mod sender;
 pub mod session;

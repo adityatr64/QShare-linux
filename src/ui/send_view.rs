@@ -16,7 +16,7 @@ pub struct SendView {
     pub staged_placeholder: gtk::Label,
     pub add_files_btn: gtk::Button,
     pub clear_files_btn: gtk::Button,
-    pub qr_connect_btn: gtk::Button,
+    pub manual_ip_btn: gtk::Button,
     pub peers_box: gtk::Box,
     pub peers_placeholder: adw::StatusPage,
     pub discovered_peers: Rc<RefCell<HashMap<String, (DiscoveredPeer, gtk::Box)>>>,
@@ -91,12 +91,12 @@ impl SendView {
         peer_header_actions.set_margin_top(4);
         peer_header_actions.set_margin_bottom(4);
 
-        let qr_connect_btn = gtk::Button::builder()
-            .label("Connect via QR / Direct IP")
-            .icon_name("camera-photo-symbolic")
+        let manual_ip_btn = gtk::Button::builder()
+            .label("Add IP Address")
+            .icon_name("network-server-symbolic")
             .build();
-        qr_connect_btn.add_css_class("flat");
-        peer_header_actions.append(&qr_connect_btn);
+        manual_ip_btn.add_css_class("flat");
+        peer_header_actions.append(&manual_ip_btn);
         peers_group.add(&peer_header_actions);
 
         let peers_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -155,7 +155,7 @@ impl SendView {
             staged_placeholder,
             add_files_btn,
             clear_files_btn,
-            qr_connect_btn,
+            manual_ip_btn,
             peers_box,
             peers_placeholder,
             discovered_peers,

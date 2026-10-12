@@ -1,8 +1,8 @@
+mod ble;
 mod crypto;
 mod discovery;
 mod events;
 mod proto;
-mod qr;
 mod secure_frame;
 mod sender;
 mod session;
@@ -11,6 +11,7 @@ mod ukey2;
 pub mod ui;
 
 use anyhow::{Context, Result};
+use ble::{BleAdvertiser, BleScanner};
 use clap::Parser;
 use discovery::{get_local_ip, MdnsAdvertiser, MdnsBrowser};
 use events::AppEvent;
@@ -18,6 +19,7 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 use sender::QuickShareSender;
 use session::QuickShareSession;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -39,7 +41,7 @@ struct Args {
     #[arg(short, long, default_value_t = 8765)]
     port: u16,
 
-    /// Device display name advertised via mDNS to nearby senders
+    /// Device display name advertised via mDNS and BLE to nearby senders
     #[arg(short, long, default_value = "Linux Quick Share")]
     name: String,
 
@@ -157,7 +159,13 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             })
         };
 
-        // 3. Create UI main window
+        // 3. Start Bluetooth LE Advertiser (UUID 0xFEF3)
+        let ble_adv = Arc::new(BleAdvertiser::new());
+        if let Err(e) = ble_adv.start_advertising(&endpoint_id, &args.name) {
+            warn!("Failed to start BLE advertiser: {:?}", e);
+        }
+
+        // 4. Create UI main window
         let main_window = Rc::new(MainWindow::new(
             app,
             &args.name,
@@ -180,7 +188,7 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             }
         });
 
-        // 4. Start mDNS Browser background task
+        // 5. Start mDNS Browser background task
         let browser_tx = app_tx.clone();
         rt_handle.spawn(async move {
             if let Ok(browser) = MdnsBrowser::new() {
@@ -192,7 +200,13 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             }
         });
 
-        // 5. Start TCP Listener accept loop
+        // 6. Start Bluetooth LE & Local LAN Peer Scanner background task
+        let ble_scan_tx = app_tx.clone();
+        rt_handle.spawn(async move {
+            BleScanner::run_loop(ble_scan_tx).await;
+        });
+
+        // 7. Start TCP Listener accept loop
         let listener_tx = app_tx.clone();
         let dest_dir = download_path.clone();
         let rt_h = rt_handle.clone();
@@ -218,7 +232,7 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             }
         });
 
-        // 6. Connect Send View "Send" action callback
+        // 8. Connect Send View "Send" action callback
         let send_tx = app_tx.clone();
         let rt_h2 = rt_handle.clone();
         let my_id = endpoint_id.clone();
@@ -250,10 +264,12 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             });
         });
 
-        // 7. Connect Visibility Switch to start/stop mDNS advertiser
+        // 9. Connect Visibility Switch to start/stop mDNS and BLE advertising
         let adv_clone = advertiser.clone();
+        let ble_clone = ble_adv.clone();
         let rt_h3 = rt_handle.clone();
         let dev_name = args.name.clone();
+        let ep_id_clone = endpoint_id.clone();
 
         main_window
             .receive_view
@@ -261,14 +277,18 @@ fn run_gui(args: Args, download_path: PathBuf, rt: tokio::runtime::Runtime) -> R
             .connect_active_notify(move |switch| {
                 let is_active = switch.is_active();
                 let adv = adv_clone.clone();
+                let ble = ble_clone.clone();
                 let name = dev_name.clone();
+                let eid = ep_id_clone.clone();
 
                 rt_h3.spawn(async move {
                     let mut lock = adv.lock().await;
                     if is_active {
                         let _ = lock.start_advertising(&name, actual_port, None);
+                        let _ = ble.start_advertising(&eid, &name);
                     } else {
                         lock.stop_advertising();
+                        ble.stop_advertising();
                     }
                 });
             });
@@ -294,10 +314,16 @@ async fn run_headless(args: Args, download_path: PathBuf) -> Result<()> {
         println!("[SEND] Target: {}", target);
         println!("[SEND] Files:  {:?}", files);
 
-        let info = qr::QrConnectionInfo::parse(&target)?;
+        let (ip_str, port) = if let Some((h, p)) = target.split_once(':') {
+            (h, p.parse::<u16>().unwrap_or(8765))
+        } else {
+            (target.as_str(), 8765)
+        };
+        let ip: IpAddr = ip_str.parse().context("Invalid target IP address")?;
+
         let sender = QuickShareSender::new(
-            info.ip,
-            info.port,
+            ip,
+            port,
             "CLI1".to_string(),
             args.name,
             files,
@@ -313,11 +339,14 @@ async fn run_headless(args: Args, download_path: PathBuf) -> Result<()> {
     info!("TCP listener bound on 0.0.0.0:{}", actual_port);
 
     let mut advertiser = MdnsAdvertiser::new()?;
-    if let Err(e) = advertiser.start_advertising(&args.name, actual_port, None) {
-        error!("Warning: mDNS advertising failed: {:?}. Direct connections still accepted.", e);
-    }
+    let endpoint_id = advertiser
+        .start_advertising(&args.name, actual_port, None)
+        .unwrap_or_else(|_| "LNX1".to_string());
 
-    info!("Headless daemon ready and awaiting incoming transfers...");
+    let ble_adv = BleAdvertiser::new();
+    let _ = ble_adv.start_advertising(&endpoint_id, &args.name);
+
+    info!("Headless daemon ready and awaiting incoming transfers via BLE and mDNS...");
 
     loop {
         match listener.accept().await {

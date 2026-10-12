@@ -1,4 +1,3 @@
-use crate::qr::{generate_qr_pixbuf, QrConnectionInfo};
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
@@ -106,81 +105,48 @@ impl TransferCard {
 pub struct ReceiveView {
     pub page: adw::PreferencesPage,
     pub visibility_switch: adw::SwitchRow,
-    pub qr_image: gtk::Image,
-    pub qr_link_label: gtk::Label,
-    pub copy_link_btn: gtk::Button,
     pub empty_placeholder: adw::StatusPage,
     pub transfers_box: gtk::Box,
     pub active_transfers: Rc<RefCell<HashMap<u64, TransferCard>>>,
-    pub qr_uri: Rc<RefCell<String>>,
 }
 
 impl ReceiveView {
-    pub fn new() -> Self {
+    pub fn new(device_name: &str, endpoint_id: &str, port: u16, local_ip: &str) -> Self {
         let page = adw::PreferencesPage::new();
 
-        // 1. Visibility Preferences Group
+        // 1. Device Discovery Preferences Group
         let vis_group = adw::PreferencesGroup::new();
-        vis_group.set_title("Device Discovery");
+        vis_group.set_title("Quick Share Discovery Status");
+        vis_group.set_description(Some(
+            "Actively broadcasting via Bluetooth LE (0xFEF3) and Wi-Fi LAN mDNS (_FC9F5ED42C8A)"
+        ));
 
         let visibility_switch = adw::SwitchRow::builder()
             .title("Visible to Everyone")
-            .subtitle("Broadcast mDNS service (_FC9F5ED42C8A) on local network")
+            .subtitle("Nearby Android and PC devices can discover and send files to this device")
             .active(true)
             .build();
         vis_group.add(&visibility_switch);
+
+        let dev_row = adw::ActionRow::builder()
+            .title("Device Name")
+            .subtitle(device_name)
+            .build();
+        let dev_icon = gtk::Image::from_icon_name("computer-symbolic");
+        dev_row.add_prefix(&dev_icon);
+        vis_group.add(&dev_row);
+
+        let ep_row = adw::ActionRow::builder()
+            .title("Endpoint ID & Listening Address")
+            .subtitle(&format!("ID: {} | {}:{}", endpoint_id, local_ip, port))
+            .build();
+        let ep_icon = gtk::Image::from_icon_name("network-wireless-symbolic");
+        ep_row.add_prefix(&ep_icon);
+        vis_group.add(&ep_row);
+
         page.add(&vis_group);
 
-        // 2. Direct QR Pairing Presentation Tile
-        let qr_group = adw::PreferencesGroup::new();
-        qr_group.set_title("Direct Connection and QR Pairing");
-        qr_group.set_description(Some("Nearby devices can scan or use this direct URI to bypass discovery"));
-
-        let qr_card = gtk::Box::new(gtk::Orientation::Horizontal, 16);
-        qr_card.add_css_class("card");
-        qr_card.set_margin_top(8);
-        qr_card.set_margin_bottom(8);
-        qr_card.set_margin_start(8);
-        qr_card.set_margin_end(8);
-
-        let qr_image = gtk::Image::new();
-        qr_image.set_pixel_size(160);
-        qr_image.set_margin_start(12);
-        qr_image.set_margin_top(12);
-        qr_image.set_margin_bottom(12);
-
-        let qr_details = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        qr_details.set_valign(gtk::Align::Center);
-        qr_details.set_hexpand(true);
-        qr_details.set_margin_end(12);
-
-        let scan_label = gtk::Label::new(Some("Scan to Send"));
-        scan_label.set_halign(gtk::Align::Start);
-        scan_label.add_css_class("title-3");
-
-        let qr_link_label = gtk::Label::new(Some("quickshare://127.0.0.1:8765/..."));
-        qr_link_label.set_halign(gtk::Align::Start);
-        qr_link_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-        qr_link_label.add_css_class("caption");
-        qr_link_label.add_css_class("dim-label");
-
-        let copy_link_btn = gtk::Button::builder()
-            .label("Copy Direct Pairing Link")
-            .icon_name("edit-copy-symbolic")
-            .halign(gtk::Align::Start)
-            .build();
-        copy_link_btn.add_css_class("flat");
-
-        qr_details.append(&scan_label);
-        qr_details.append(&qr_link_label);
-        qr_details.append(&copy_link_btn);
-
-        qr_card.append(&qr_image);
-        qr_card.append(&qr_details);
-        qr_group.add(&qr_card);
-        page.add(&qr_group);
-
-        // 3. Active / Recent Transfers Area
+        // 2. Active / Recent Transfers Area
         let trans_group = adw::PreferencesGroup::new();
         trans_group.set_title("Transfers");
 
@@ -188,7 +154,7 @@ impl ReceiveView {
 
         let empty_placeholder = adw::StatusPage::builder()
             .title("Ready to Receive")
-            .description("Keep Quick Share open to receive incoming files from nearby peers")
+            .description("Open Quick Share or Nearby Share on your mobile device to transfer files directly to this PC")
             .icon_name("folder-download-symbolic")
             .build();
         empty_placeholder.set_height_request(180);
@@ -197,28 +163,12 @@ impl ReceiveView {
         trans_group.add(&transfers_box);
         page.add(&trans_group);
 
-        let qr_uri = Rc::new(RefCell::new(String::new()));
-
         Self {
             page,
             visibility_switch,
-            qr_image,
-            qr_link_label,
-            copy_link_btn,
             empty_placeholder,
             transfers_box,
             active_transfers: Rc::new(RefCell::new(HashMap::new())),
-            qr_uri,
-        }
-    }
-
-    pub fn set_qr_info(&self, info: &QrConnectionInfo) {
-        let uri = info.to_uri();
-        *self.qr_uri.borrow_mut() = uri.clone();
-        self.qr_link_label.set_text(&uri);
-
-        if let Ok(pixbuf) = generate_qr_pixbuf(info, 160) {
-            self.qr_image.set_from_pixbuf(Some(&pixbuf));
         }
     }
 

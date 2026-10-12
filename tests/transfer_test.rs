@@ -1,45 +1,6 @@
-use quickshare_receiver::qr::QrConnectionInfo;
 use quickshare_receiver::secure_frame::{decrypt_secure_frame, encrypt_secure_frame, ProtocolRole};
 use quickshare_receiver::ukey2::{perform_ukey2_handshake_client, perform_ukey2_handshake_server};
-use std::net::IpAddr;
 use tokio::io::duplex;
-
-#[test]
-fn test_qr_roundtrip_and_parsing() {
-    let original = QrConnectionInfo {
-        ip: "192.168.1.120".parse().unwrap(),
-        port: 8765,
-        endpoint_id: "TEST".to_string(),
-        device_name: "Pixel 9 Pro".to_string(),
-    };
-
-    let uri = original.to_uri();
-    assert!(uri.starts_with("quickshare://192.168.1.120:8765/TEST?name=Pixel%209%20Pro"));
-
-    let parsed = QrConnectionInfo::parse(&uri).expect("Failed to parse URI");
-    assert_eq!(original, parsed);
-
-    // Test JSON format
-    let json = r#"{"ip":"10.0.0.5","port":9000,"id":"JSON","name":"Galaxy Tab"}"#;
-    let json_parsed = QrConnectionInfo::parse(json).expect("Failed to parse JSON");
-    assert_eq!(json_parsed.ip, "10.0.0.5".parse::<IpAddr>().unwrap());
-    assert_eq!(json_parsed.port, 9000);
-    assert_eq!(json_parsed.endpoint_id, "JSON");
-    assert_eq!(json_parsed.device_name, "Galaxy Tab");
-
-    // Test plain IP:Port
-    let direct = "192.168.1.50:4444";
-    let direct_parsed = QrConnectionInfo::parse(direct).expect("Failed to parse direct ip:port");
-    assert_eq!(direct_parsed.ip, "192.168.1.50".parse::<IpAddr>().unwrap());
-    assert_eq!(direct_parsed.port, 4444);
-
-    // Test QR Pixbuf generation
-    let pixbuf = quickshare_receiver::qr::generate_qr_pixbuf(&original, 160);
-    assert!(pixbuf.is_ok());
-    let pb = pixbuf.unwrap();
-    assert!(pb.width() >= 160);
-    assert!(pb.height() >= 160);
-}
 
 #[tokio::test]
 async fn test_end_to_end_ukey2_and_secure_channel() {

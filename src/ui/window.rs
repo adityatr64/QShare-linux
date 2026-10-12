@@ -1,14 +1,13 @@
 use crate::events::{AppEvent, DeviceType, DiscoveredPeer};
-use crate::qr::QrConnectionInfo;
 use crate::ui::receive_view::ReceiveView;
 use crate::ui::send_view::SendView;
 use crate::ui::settings_view::SettingsView;
-use gtk4::gdk;
 use gtk4 as gtk;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::sync::oneshot;
@@ -19,7 +18,6 @@ pub struct MainWindow {
     pub receive_view: Rc<ReceiveView>,
     pub send_view: Rc<SendView>,
     pub settings_view: Rc<SettingsView>,
-    pub qr_info: Rc<RefCell<QrConnectionInfo>>,
 }
 
 impl MainWindow {
@@ -49,7 +47,7 @@ impl MainWindow {
         view_stack.set_hexpand(true);
 
         // 1. Receive View
-        let receive_view = Rc::new(ReceiveView::new());
+        let receive_view = Rc::new(ReceiveView::new(device_name, endpoint_id, port, local_ip));
         view_stack.add_titled_with_icon(
             &receive_view.page,
             Some("receive"),
@@ -98,27 +96,6 @@ impl MainWindow {
         toast_overlay.set_child(Some(&toolbar_view));
         window.set_content(Some(&toast_overlay));
 
-        let ip_parsed = local_ip.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
-        let qr_info = Rc::new(RefCell::new(QrConnectionInfo {
-            ip: ip_parsed,
-            port,
-            endpoint_id: endpoint_id.to_string(),
-            device_name: device_name.to_string(),
-        }));
-
-        receive_view.set_qr_info(&qr_info.borrow());
-
-        // Connect Copy Link button
-        let qr_info_clone = qr_info.clone();
-        let overlay_clone = toast_overlay.clone();
-        receive_view.copy_link_btn.connect_clicked(move |_| {
-            let uri = qr_info_clone.borrow().to_uri();
-            if let Some(display) = gdk::Display::default() {
-                display.clipboard().set_text(&uri);
-                overlay_clone.add_toast(adw::Toast::new("Direct pairing link copied to clipboard!"));
-            }
-        });
-
         // Connect Add Files button in Send View
         let window_weak = window.downgrade();
         let send_view_clone = send_view.clone();
@@ -160,13 +137,13 @@ impl MainWindow {
             send_view_clone2.clear_staged();
         });
 
-        // Connect "Connect via QR / Direct IP" button in Send View
+        // Connect "Add IP Address" button in Send View
         let window_weak2 = window.downgrade();
         let send_view_clone3 = send_view.clone();
         let overlay_clone2 = toast_overlay.clone();
-        send_view.qr_connect_btn.connect_clicked(move |_| {
+        send_view.manual_ip_btn.connect_clicked(move |_| {
             if let Some(parent) = window_weak2.upgrade() {
-                show_qr_connect_dialog(&parent, send_view_clone3.clone(), overlay_clone2.clone());
+                show_add_ip_dialog(&parent, send_view_clone3.clone(), overlay_clone2.clone());
             }
         });
 
@@ -209,7 +186,6 @@ impl MainWindow {
             receive_view,
             send_view,
             settings_view,
-            qr_info,
         }
     }
 
@@ -338,20 +314,20 @@ impl MainWindow {
     }
 }
 
-fn show_qr_connect_dialog(
+fn show_add_ip_dialog(
     parent: &adw::ApplicationWindow,
     send_view: Rc<SendView>,
     overlay: adw::ToastOverlay,
 ) {
     let dialog = adw::MessageDialog::new(
         Some(parent),
-        Some("Connect via QR or Direct Connection"),
-        Some("Enter a quickshare:// URL, JSON payload, or IP:Port (e.g. 192.168.1.100:8765)"),
+        Some("Add Device by IP Address"),
+        Some("Enter the target IP address and optional port (e.g. 192.168.1.7:8765):"),
     );
 
     let entry = adw::EntryRow::builder()
-        .title("Direct Connection Address")
-        .text("quickshare://")
+        .title("IP:Port")
+        .text("192.168.1.7:8765")
         .build();
     entry.set_margin_start(16);
     entry.set_margin_end(16);
@@ -360,29 +336,36 @@ fn show_qr_connect_dialog(
 
     dialog.set_extra_child(Some(&entry));
     dialog.add_response("cancel", "Cancel");
-    dialog.add_response("connect", "Connect and Add Target");
-    dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("connect"));
+    dialog.add_response("add", "Add Device");
+    dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("add"));
 
     let entry_clone = entry.clone();
     dialog.connect_response(None, move |_, response| {
-        if response == "connect" {
+        if response == "add" {
             let input = entry_clone.text().to_string();
-            match QrConnectionInfo::parse(&input) {
-                Ok(info) => {
+            let trimmed = input.trim();
+            let (ip_str, port) = if let Some((h, p)) = trimmed.split_once(':') {
+                (h, p.parse::<u16>().unwrap_or(8765))
+            } else {
+                (trimmed, 8765)
+            };
+
+            match ip_str.parse::<IpAddr>() {
+                Ok(ip) => {
                     let peer = DiscoveredPeer {
-                        id: info.endpoint_id,
-                        name: info.device_name,
+                        id: format!("ip_{}", ip_str.replace('.', "_")),
+                        name: format!("Device ({})", ip_str),
                         device_type: DeviceType::Phone,
-                        ip: info.ip,
-                        port: info.port,
+                        ip,
+                        port,
                     };
                     let name = peer.name.clone();
                     send_view.add_peer(peer);
-                    overlay.add_toast(adw::Toast::new(&format!("Direct peer added: {}", name)));
+                    overlay.add_toast(adw::Toast::new(&format!("Target added: {}", name)));
                 }
                 Err(e) => {
-                    overlay.add_toast(adw::Toast::new(&format!("Invalid QR connection format: {}", e)));
+                    overlay.add_toast(adw::Toast::new(&format!("Invalid IP address: {}", e)));
                 }
             }
         }
