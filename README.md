@@ -60,6 +60,7 @@ This project is intended strictly for interoperability purposes in accordance wi
 
 This implementation builds upon the foundational reverse-engineering research and documentation produced by the open-source community:
 - [Google Nearby Connections Protocol](https://github.com/google/nearby): Google open-source Nearby specifications and core design references.
+- [REA](https://github.com/morluto/rea): Reverse engineer anything with agents, from app behavior down to native binaries. 
 - [Google UKEY2 Specification](https://github.com/google/ukey2): Universal Key Exchange 2 protocol specification and reference implementations.
 - [rquickshare by Martichou](https://github.com/Martichou/rquickshare): Rust implementation of Quick Share client and receiver logic.
 - [NearDrop by Grishka](https://github.com/grishka/NearDrop): macOS implementation of Google Nearby Share protocol.
