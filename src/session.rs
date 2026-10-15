@@ -15,7 +15,7 @@ use crate::proto::wire::{
     PairedKeyResultFrame, PayloadTransferFrame, SharingFrame, SharingResponseFrame, SharingV1Frame,
 };
 use crate::secure_frame::{decrypt_secure_frame, encrypt_secure_frame, ProtocolRole};
-use crate::transport::{read_length_prefixed_frame, write_length_prefixed_frame};
+use crate::transport::{read_length_prefixed_frame, write_length_prefixed_frame, FramedReader};
 use crate::ukey2::perform_ukey2_handshake_server;
 use anyhow::{anyhow, Result};
 use prost::Message;
@@ -23,10 +23,10 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
-use tokio::io::AsyncWriteExt;
+use std::time::{Duration, Instant};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
@@ -39,17 +39,19 @@ struct PendingFile {
     file: std::fs::File,
     bytes_received: u64,
     start_time: Instant,
+    last_ui_update: Instant,
 }
 
 pub struct QuickShareSession {
-    stream: TcpStream,
+    stream: Option<TcpStream>,
     download_dir: PathBuf,
-    sequence_number: i32,
     files: HashMap<i64, PendingFile>,
     bytes_payload_buffers: HashMap<i64, Vec<u8>>,
     remote_device_name: String,
     transfer_started: bool,
     ui_sender: Option<UnboundedSender<AppEvent>>,
+    tx_out: Option<mpsc::Sender<OfflineFrame>>,
+    heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl QuickShareSession {
@@ -59,22 +61,24 @@ impl QuickShareSession {
         ui_sender: Option<UnboundedSender<AppEvent>>,
     ) -> Self {
         Self {
-            stream,
+            stream: Some(stream),
             download_dir,
-            sequence_number: 1, // 1-indexed in Google Nearby Connections
             files: HashMap::new(),
             bytes_payload_buffers: HashMap::new(),
             remote_device_name: "Nearby Device".to_string(),
             transfer_started: false,
             ui_sender,
+            tx_out: None,
+            heartbeat_handle: None,
         }
     }
 
     pub async fn run(mut self) -> Result<()> {
-        info!("Accepted incoming connection from {}", self.stream.peer_addr()?);
+        let mut stream = self.stream.take().ok_or_else(|| anyhow!("TCP stream already taken"))?;
+        info!("Accepted incoming connection from {}", stream.peer_addr()?);
 
         // 1. Read unencrypted ConnectionRequest from stream
-        let raw_req = read_length_prefixed_frame(&mut self.stream).await?;
+        let raw_req = read_length_prefixed_frame(&mut stream).await?;
         let offline_req = OfflineFrame::decode(raw_req.as_slice())
             .map_err(|e| anyhow!("Failed to decode unencrypted ConnectionRequest: {:?}", e))?;
 
@@ -85,22 +89,40 @@ impl QuickShareSession {
         }
 
         if let Some(req) = v1_req.connection_request {
-            if let Some(name) = req.endpoint_name {
-                if !name.trim().is_empty() {
-                    self.remote_device_name = extract_clean_device_name(&name);
+            let mut resolved_name: Option<String> = None;
+
+            if let Some(ref name_bytes) = req.endpoint_name {
+                let parsed = extract_clean_device_name(name_bytes);
+                if parsed != "Nearby Device" {
+                    resolved_name = Some(parsed);
                 }
-            } else if let Some(id) = req.endpoint_id {
-                self.remote_device_name = format!("Device {}", id);
+            }
+            if resolved_name.is_none() {
+                if let Some(ref info_bytes) = req.endpoint_info {
+                    let parsed = extract_clean_device_name(info_bytes);
+                    if parsed != "Nearby Device" {
+                        resolved_name = Some(parsed);
+                    }
+                }
+            }
+            if resolved_name.is_none() {
+                if let Some(ref id) = req.endpoint_id {
+                    resolved_name = Some(format!("Device {}", id));
+                }
+            }
+
+            if let Some(name) = resolved_name {
+                self.remote_device_name = name;
             }
             info!("Received ConnectionRequest from '{}'", self.remote_device_name);
         }
 
         // 2. Perform UKEY2 Handshake as Server
-        let keys = perform_ukey2_handshake_server(&mut self.stream).await?;
+        let keys = perform_ukey2_handshake_server(&mut stream).await?;
         info!("UKEY2 Handshake finished. Verification PIN: [{}]", keys.pin);
 
         // 3. Exchange unencrypted ConnectionResponse with client
-        let raw_client_resp = read_length_prefixed_frame(&mut self.stream).await?;
+        let raw_client_resp = read_length_prefixed_frame(&mut stream).await?;
         let client_resp_frame = OfflineFrame::decode(raw_client_resp.as_slice())
             .map_err(|e| anyhow!("Failed to decode unencrypted ConnectionResponse: {:?}", e))?;
         debug!("Received unencrypted ConnectionResponse from client: {:?}", client_resp_frame);
@@ -136,11 +158,11 @@ impl QuickShareSession {
         };
         let mut raw_resp_bytes = Vec::new();
         resp_frame.encode(&mut raw_resp_bytes)?;
-        write_length_prefixed_frame(&mut self.stream, &raw_resp_bytes).await?;
+        write_length_prefixed_frame(&mut stream, &raw_resp_bytes).await?;
         info!("Sent unencrypted Connection Response (ACCEPT)");
 
         // 4. Notify UI that this peer connected and is available (ignore self/loopback connections)
-        if let Ok(peer_addr) = self.stream.peer_addr() {
+        if let Ok(peer_addr) = stream.peer_addr() {
             if !crate::discovery::is_self_ip(&peer_addr.ip()) {
                 if let Some(ref tx) = self.ui_sender {
                     let _ = tx.send(AppEvent::PeerDiscovered(DiscoveredPeer {
@@ -156,7 +178,33 @@ impl QuickShareSession {
             }
         }
 
-        // 5. Send initial PairedKeyEncryption SharingFrame to initiate transfer handshake
+        // 5. Split TCP stream into independent read and write halves
+        let (read_half, mut write_half) = stream.into_split();
+        let (tx_out, mut rx_out) = mpsc::channel::<OfflineFrame>(128);
+        self.tx_out = Some(tx_out.clone());
+
+        // Spawn background writer task with 1-indexed sequential sequence numbering
+        let writer_keys = keys.clone();
+        let writer_task = tokio::spawn(async move {
+            let mut seq = 1i32;
+            while let Some(frame) = rx_out.recv().await {
+                match encrypt_secure_frame(&writer_keys, &frame, seq, ProtocolRole::Server) {
+                    Ok(enc_bytes) => {
+                        seq += 1;
+                        if let Err(e) = write_length_prefixed_frame(&mut write_half, &enc_bytes).await {
+                            debug!("Writer task encountered error writing to socket: {:?}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to encrypt secure frame: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // 6. Send initial PairedKeyEncryption SharingFrame to initiate transfer handshake
         let paired_enc = SharingFrame {
             version: Some(1),
             v1: Some(SharingV1Frame {
@@ -174,39 +222,64 @@ impl QuickShareSession {
                 progress_update: None,
             }),
         };
-        self.send_sharing_frame(&keys, paired_enc).await?;
+        self.send_sharing_frame(paired_enc).await?;
         info!("Sent encrypted initial PairedKeyEncryption SharingFrame to sender");
 
-        // 6. Main encrypted frame handling loop
+        // 7. Main encrypted frame handling loop with FramedReader
+        let mut framed_reader = FramedReader::new(read_half);
+        let mut session_finished = false;
+
         loop {
-            let raw_encrypted_frame = match read_length_prefixed_frame(&mut self.stream).await {
+            let raw_encrypted_frame = match framed_reader.next_frame().await {
                 Ok(frame) => frame,
                 Err(e) => {
                     if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                         if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
                             info!("Peer closed connection cleanly.");
-                            return Ok(());
+                            break;
                         }
                     }
-                    return Err(e);
+                    warn!("Session read error: {:?}", e);
+                    break;
                 }
             };
 
-            let (offline_frame, _seq) = decrypt_secure_frame(
+            let (offline_frame, _seq) = match decrypt_secure_frame(
                 &keys,
                 &raw_encrypted_frame,
                 ProtocolRole::Server,
-            )?;
-            if self.handle_offline_frame(&keys, offline_frame).await? {
+            ) {
+                Ok(dec) => dec,
+                Err(e) => {
+                    warn!("Failed to decrypt secure frame: {:?}", e);
+                    continue;
+                }
+            };
+
+            if self.handle_offline_frame(&keys, &mut framed_reader, offline_frame).await? {
                 info!("Transfer session finished cleanly. Closing connection.");
-                return Ok(());
+                session_finished = true;
+                break;
             }
+        }
+
+        // Cancel background tasks on session exit
+        if let Some(h) = self.heartbeat_handle.take() {
+            h.abort();
+        }
+        writer_task.abort();
+
+        if session_finished {
+            Ok(())
+        } else {
+            Ok(())
         }
     }
 
     async fn handle_offline_frame(
         &mut self,
         keys: &SessionKeys,
+        reader: &mut FramedReader<OwnedReadHalf>,
         frame: OfflineFrame,
     ) -> Result<bool> {
         let v1 = match frame.v1 {
@@ -225,10 +298,9 @@ impl QuickShareSession {
 
             ConnectionsFrameType::PairedKeyEncryption => {
                 info!("Received ConnectionsPairedKeyEncryption frame from peer, replying with PairedKeyResult (UNABLE)");
-                // Respond with PairedKeyResult: UNABLE (3) - indicates no Google Contacts pre-shared keys, standard transfer
                 let result = PairedKeyResultFrame {
                     status: Some(PairedKeyStatus::Unable as i32),
-                    os_type: Some(1), // Linux
+                    os_type: Some(crate::proto::wire::os_info::OsType::Linux as i32),
                 };
                 let mut signed_data = Vec::new();
                 result.encode(&mut signed_data)?;
@@ -254,13 +326,13 @@ impl QuickShareSession {
                         authentication_result: None,
                     }),
                 };
-                self.send_encrypted_frame(keys, &resp_frame).await?;
+                self.send_encrypted_frame(resp_frame).await?;
                 info!("Sent ConnectionsPairedKeyEncryption result (UNABLE)");
             }
 
             ConnectionsFrameType::PayloadTransfer => {
                 if let Some(transfer) = v1.payload_transfer {
-                    return self.handle_payload_transfer(keys, transfer).await;
+                    return self.handle_payload_transfer(keys, reader, transfer).await;
                 }
             }
 
@@ -282,7 +354,7 @@ impl QuickShareSession {
                             authentication_result: None,
                         }),
                     };
-                    self.send_encrypted_frame(keys, &keep_alive_ack).await?;
+                    self.send_encrypted_frame(keep_alive_ack).await?;
                     tracing::debug!("Replied to KeepAlive with ACK");
                 }
             }
@@ -310,8 +382,7 @@ impl QuickShareSession {
                                 authentication_result: None,
                             }),
                         };
-                        let _ = self.send_encrypted_frame(keys, &ack_frame).await;
-                        let _ = self.stream.flush().await;
+                        let _ = self.send_encrypted_frame(ack_frame).await;
                     }
                 }
                 return Ok(true);
@@ -327,6 +398,7 @@ impl QuickShareSession {
     async fn handle_payload_transfer(
         &mut self,
         keys: &SessionKeys,
+        reader: &mut FramedReader<OwnedReadHalf>,
         transfer: PayloadTransferFrame,
     ) -> Result<bool> {
         match transfer.packet_type() {
@@ -365,7 +437,7 @@ impl QuickShareSession {
                                                             progress_update: None,
                                                         }),
                                                     };
-                                                    self.send_sharing_frame(keys, result_frame).await?;
+                                                    self.send_sharing_frame(result_frame).await?;
                                                     info!("Sent PairedKeyResult SharingFrame (UNABLE)");
                                                 }
                                                 SharingFrameType::PairedKeyResult => {
@@ -373,7 +445,7 @@ impl QuickShareSession {
                                                 }
                                                 SharingFrameType::Introduction => {
                                                     if let Some(intro) = v1.introduction {
-                                                        self.process_introduction(keys, intro).await?;
+                                                        self.process_introduction(keys, reader, intro).await?;
                                                     }
                                                 }
                                                 SharingFrameType::Cancel => {
@@ -404,22 +476,29 @@ impl QuickShareSession {
                                     pending.file.write_all(body)?;
                                     pending.bytes_received += body.len() as u64;
 
-                                    let elapsed = pending.start_time.elapsed().as_secs_f64();
-                                    let speed_mbps = if elapsed > 0.05 {
-                                        (pending.bytes_received as f64 / 1_048_576.0) / elapsed
-                                    } else {
-                                        0.0
-                                    };
+                                    let is_complete = is_last || (pending.size > 0 && pending.bytes_received >= pending.size as u64);
 
-                                    if let Some(ref tx) = self.ui_sender {
-                                        let _ = tx.send(AppEvent::TransferProgress {
-                                            transfer_id: payload_id as u64,
-                                            filename: pending.name.clone(),
-                                            transferred: pending.bytes_received,
-                                            total: pending.size as u64,
-                                            speed_mbps,
-                                            is_send: false,
-                                        });
+                                    // Throttle UI updates to at most once per 80ms to avoid overwhelming GTK loop
+                                    let now = Instant::now();
+                                    if now.duration_since(pending.last_ui_update) >= Duration::from_millis(80) || is_complete {
+                                        pending.last_ui_update = now;
+                                        let elapsed = pending.start_time.elapsed().as_secs_f64();
+                                        let speed_mbps = if elapsed > 0.05 {
+                                            (pending.bytes_received as f64 / 1_048_576.0) / elapsed
+                                        } else {
+                                            0.0
+                                        };
+
+                                        if let Some(ref tx) = self.ui_sender {
+                                            let _ = tx.send(AppEvent::TransferProgress {
+                                                transfer_id: payload_id as u64,
+                                                filename: pending.name.clone(),
+                                                transferred: pending.bytes_received,
+                                                total: pending.size as u64,
+                                                speed_mbps,
+                                                is_send: false,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -450,7 +529,15 @@ impl QuickShareSession {
                             // Send PAYLOAD_RECEIVED_ACK
                             let ack = PayloadTransferFrame {
                                 packet_type: Some(PacketType::Control as i32),
-                                payload_header: None,
+                                payload_header: Some(PayloadHeader {
+                                    id: Some(payload_id),
+                                    r#type: Some(PayloadType::File as i32),
+                                    total_size: None,
+                                    is_sensitive: None,
+                                    file_name: None,
+                                    parent_folder: None,
+                                    last_modified_timestamp_millis: None,
+                                }),
                                 payload_chunk: None,
                                 control_message: Some(ControlMessage {
                                     event: Some(ControlEventType::PayloadReceivedAck as i32),
@@ -472,8 +559,7 @@ impl QuickShareSession {
                                     authentication_result: None,
                                 }),
                             };
-                            self.send_encrypted_frame(keys, &ack_frame).await?;
-                            self.stream.flush().await?;
+                            self.send_encrypted_frame(ack_frame).await?;
 
                             // Remove completed file from pending files
                             self.files.remove(&payload_id);
@@ -498,9 +584,8 @@ impl QuickShareSession {
                                         authentication_result: None,
                                     }),
                                 };
-                                let _ = self.send_encrypted_frame(keys, &disconnect_frame).await;
-                                let _ = self.stream.flush().await;
-                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                let _ = self.send_encrypted_frame(disconnect_frame).await;
+                                tokio::time::sleep(Duration::from_millis(300)).await;
                                 return Ok(true);
                             }
                         }
@@ -523,10 +608,10 @@ impl QuickShareSession {
         Ok(false)
     }
 
-
     async fn process_introduction(
         &mut self,
         keys: &SessionKeys,
+        reader: &mut FramedReader<OwnedReadHalf>,
         intro: IntroductionFrame,
     ) -> Result<()> {
         info!("Received IntroductionFrame with {} files", intro.file_metadata.len());
@@ -578,7 +663,7 @@ impl QuickShareSession {
                                     }
                                 }
                             }
-                            frame_res = read_length_prefixed_frame(&mut self.stream) => {
+                            frame_res = reader.next_frame() => {
                                 match frame_res {
                                     Ok(frame_bytes) => {
                                         if let Ok((offline, _seq)) = decrypt_secure_frame(keys, &frame_bytes, ProtocolRole::Server) {
@@ -601,7 +686,7 @@ impl QuickShareSession {
                                                                 authentication_result: None,
                                                             }),
                                                         };
-                                                        let _ = self.send_encrypted_frame(keys, &keep_alive_ack).await;
+                                                        let _ = self.send_encrypted_frame(keep_alive_ack).await;
                                                         tracing::debug!("Replied to KeepAlive with ACK while awaiting user confirmation");
                                                     }
                                                 } else if v1.r#type == Some(ConnectionsFrameType::Disconnection as i32) {
@@ -636,7 +721,7 @@ impl QuickShareSession {
             let resp = SharingResponseFrame {
                 status: Some(SharingResponseStatus::Reject as i32),
             };
-            self.send_sharing_response(keys, resp).await?;
+            self.send_sharing_response(resp).await?;
             return Err(anyhow!("Transfer declined by user"));
         }
 
@@ -672,6 +757,7 @@ impl QuickShareSession {
                 });
             }
 
+            let now = Instant::now();
             self.files.insert(
                 payload_id,
                 PendingFile {
@@ -681,7 +767,8 @@ impl QuickShareSession {
                     path: target_path,
                     file,
                     bytes_received: 0,
-                    start_time: Instant::now(),
+                    start_time: now,
+                    last_ui_update: now,
                 },
             );
         }
@@ -690,14 +777,47 @@ impl QuickShareSession {
         let resp = SharingResponseFrame {
             status: Some(SharingResponseStatus::Accept as i32),
         };
-        self.send_sharing_response(keys, resp).await?;
+        self.send_sharing_response(resp).await?;
         info!("Sent ACCEPT sharing response frame to sender");
+
+        // Start KeepAlive heartbeat task during active file transfer
+        // Prevents Windows Quick Share 30-second keep_alive_timeout disconnect on large transfers
+        if let Some(ref tx_out) = self.tx_out {
+            let tx_heartbeat = tx_out.clone();
+            let heartbeat_task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(5000));
+                interval.tick().await; // Consume immediate first tick
+                loop {
+                    interval.tick().await;
+                    let keep_alive = OfflineFrame {
+                        version: Some(1),
+                        v1: Some(ConnectionsV1Frame {
+                            r#type: Some(ConnectionsFrameType::KeepAlive as i32),
+                            connection_request: None,
+                            connection_response: None,
+                            payload_transfer: None,
+                            bandwidth_upgrade_negotiation: None,
+                            keep_alive: Some(KeepAliveFrame { ack: Some(false) }),
+                            disconnection: None,
+                            paired_key_encryption: None,
+                            authentication_message: None,
+                            authentication_result: None,
+                        }),
+                    };
+                    if tx_heartbeat.send(keep_alive).await.is_err() {
+                        break;
+                    }
+                    tracing::debug!("Sent periodic KeepAlive heartbeat (every 5s) during payload transfer");
+                }
+            });
+            self.heartbeat_handle = Some(heartbeat_task);
+        }
+
         Ok(())
     }
 
     async fn send_sharing_response(
-        &mut self,
-        keys: &SessionKeys,
+        &self,
         resp: SharingResponseFrame,
     ) -> Result<()> {
         let sharing_resp = SharingFrame {
@@ -712,12 +832,11 @@ impl QuickShareSession {
                 progress_update: None,
             }),
         };
-        self.send_sharing_frame(keys, sharing_resp).await
+        self.send_sharing_frame(sharing_resp).await
     }
 
     async fn send_sharing_frame(
-        &mut self,
-        keys: &SessionKeys,
+        &self,
         frame: SharingFrame,
     ) -> Result<()> {
         let mut frame_bytes = Vec::new();
@@ -761,7 +880,7 @@ impl QuickShareSession {
                 authentication_result: None,
             }),
         };
-        self.send_encrypted_frame(keys, &offline_chunk1).await?;
+        self.send_encrypted_frame(offline_chunk1).await?;
 
         // 2. Terminal chunk: flags=1 (LAST_CHUNK), offset=frame_bytes.len(), body=None
         let chunk2 = PayloadTransferFrame {
@@ -799,31 +918,27 @@ impl QuickShareSession {
                 authentication_result: None,
             }),
         };
-        self.send_encrypted_frame(keys, &offline_chunk2).await
+        self.send_encrypted_frame(offline_chunk2).await
     }
 
     async fn send_encrypted_frame(
-        &mut self,
-        keys: &SessionKeys,
-        frame: &OfflineFrame,
+        &self,
+        frame: OfflineFrame,
     ) -> Result<()> {
-        let encrypted_bytes = encrypt_secure_frame(
-            keys,
-            frame,
-            self.sequence_number,
-            ProtocolRole::Server,
-        )?;
-        self.sequence_number += 1;
-        write_length_prefixed_frame(&mut self.stream, &encrypted_bytes).await?;
+        if let Some(ref tx) = self.tx_out {
+            tx.send(frame)
+                .await
+                .map_err(|e| anyhow!("Failed to send frame to writer task: {:?}", e))?;
+        }
         Ok(())
     }
 }
 
-pub fn extract_clean_device_name(raw: &str) -> String {
-    let bytes = raw.as_bytes();
+pub fn extract_clean_device_name(bytes: &[u8]) -> String {
+    // 1. Check if it's formatted as standard Nearby EndpointInfo: [header(1), salt(16), name_len(1), name...]
     if bytes.len() >= 18 {
         let name_len = bytes[17] as usize;
-        if bytes.len() >= 18 + name_len {
+        if name_len > 0 && bytes.len() >= 18 + name_len {
             if let Ok(clean) = std::str::from_utf8(&bytes[18..18 + name_len]) {
                 let trimmed = clean.trim();
                 if !trimmed.is_empty() {
@@ -832,7 +947,25 @@ pub fn extract_clean_device_name(raw: &str) -> String {
             }
         }
     }
-    let cleaned: String = raw
+    // 2. Check if it's formatted as combined [version(1), ep_id(4), hash(3), len(1), endpoint_info...]
+    if bytes.len() >= 9 {
+        let info_len = bytes[8] as usize;
+        if bytes.len() >= 9 + info_len && info_len >= 18 {
+            let ep_info = &bytes[9..9 + info_len];
+            let name_len = ep_info[17] as usize;
+            if name_len > 0 && ep_info.len() >= 18 + name_len {
+                if let Ok(clean) = std::str::from_utf8(&ep_info[18..18 + name_len]) {
+                    let trimmed = clean.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_string();
+                    }
+                }
+            }
+        }
+    }
+    // 3. Fallback: UTF-8 lossy conversion stripping control / replacement characters
+    let lossy = String::from_utf8_lossy(bytes);
+    let cleaned: String = lossy
         .chars()
         .filter(|c| !c.is_control() && *c != '\u{fffd}')
         .collect();
@@ -840,7 +973,6 @@ pub fn extract_clean_device_name(raw: &str) -> String {
     if !trimmed.is_empty() {
         trimmed.to_string()
     } else {
-        "Android Device".to_string()
+        "Nearby Device".to_string()
     }
 }
-

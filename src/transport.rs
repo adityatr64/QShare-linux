@@ -27,3 +27,44 @@ pub async fn write_length_prefixed_frame<W: AsyncWrite + Unpin>(
     writer.flush().await?;
     Ok(())
 }
+
+/// A buffered, cancellation-safe reader for length-prefixed frames.
+pub struct FramedReader<R> {
+    reader: R,
+    buf: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> FramedReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: Vec::with_capacity(65536),
+        }
+    }
+
+    pub async fn next_frame(&mut self) -> Result<Vec<u8>> {
+        loop {
+            if self.buf.len() >= 4 {
+                let len = u32::from_be_bytes(self.buf[..4].try_into().unwrap()) as usize;
+                if len > 64 * 1024 * 1024 {
+                    return Err(anyhow!("Frame length exceeds maximum safety limit (64MB): {} bytes", len));
+                }
+                if self.buf.len() >= 4 + len {
+                    let frame = self.buf[4..4 + len].to_vec();
+                    self.buf.drain(..4 + len);
+                    return Ok(frame);
+                }
+            }
+            let mut chunk = [0u8; 65536];
+            let n = self.reader.read(&mut chunk).await?;
+            if n == 0 {
+                if self.buf.is_empty() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof").into());
+                } else {
+                    return Err(anyhow!("Unexpected EOF with partial frame ({} bytes remaining)", self.buf.len()));
+                }
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+}

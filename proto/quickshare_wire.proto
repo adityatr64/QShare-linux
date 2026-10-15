@@ -174,7 +174,7 @@ message ConnectionRequestFrame {
     INSTANT = 1;
   }
   optional string endpoint_id = 1;
-  optional string endpoint_name = 2;
+  optional bytes endpoint_name = 2;
   optional bytes handshake_data = 3;
   optional int32 nonce = 4;
   repeated Medium mediums = 5;

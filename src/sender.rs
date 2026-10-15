@@ -78,7 +78,7 @@ impl QuickShareSender {
 
         let conn_req = ConnectionRequestFrame {
             endpoint_id: Some(self.my_endpoint_id.clone()),
-            endpoint_name: Some(self.my_device_name.clone()),
+            endpoint_name: Some(self.my_device_name.as_bytes().to_vec()),
             handshake_data: None,
             nonce: Some(rand::random::<i32>().abs()),
             mediums: vec![1, 5], // MDNS, WifiLan

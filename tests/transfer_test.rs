@@ -96,7 +96,7 @@ async fn test_full_protocol_frame_exchange_flow() {
         let v1 = req_frame.v1.unwrap();
         assert_eq!(v1.r#type(), ConnectionsFrameType::ConnectionRequest);
         let req = v1.connection_request.unwrap();
-        assert_eq!(req.endpoint_name.as_deref(), Some("Test Sender"));
+        assert_eq!(req.endpoint_name.as_deref(), Some(b"Test Sender".as_slice()));
 
         // Send ConnectionResponse (ACCEPT)
         let resp = OfflineFrame {
@@ -242,7 +242,7 @@ async fn test_full_protocol_frame_exchange_flow() {
                 r#type: Some(ConnectionsFrameType::ConnectionRequest as i32),
                 connection_request: Some(ConnectionRequestFrame {
                     endpoint_id: Some("CLNT".to_string()),
-                    endpoint_name: Some("Test Sender".to_string()),
+                    endpoint_name: Some(b"Test Sender".to_vec()),
                     handshake_data: None,
                     nonce: None,
                     mediums: vec![5],
@@ -431,4 +431,98 @@ async fn test_full_protocol_frame_exchange_flow() {
     s_res.unwrap();
     c_res.unwrap();
 }
+
+#[test]
+fn test_non_utf8_endpoint_name_decoding() {
+    use prost::Message;
+    use qshare_linux::proto::wire::{
+        connections_v1_frame::FrameType as ConnectionsFrameType,
+        ConnectionRequestFrame, ConnectionsV1Frame, OfflineFrame,
+    };
+    use qshare_linux::session::extract_clean_device_name;
+
+    // Simulate Google Quick Share Windows binary endpoint_name payload:
+    // [header(1), salt(16 non-utf8 random bytes), name_len(1), name...]
+    let mut raw_endpoint_info = vec![0x06u8]; // header
+    let non_utf8_salt = vec![
+        0xFF, 0xFE, 0x80, 0x81, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x12, 0x34, 0x56, 0x78, 0x9A,
+        0xBC, 0xDE,
+    ];
+    raw_endpoint_info.extend_from_slice(&non_utf8_salt);
+    let dev_name = b"Aditya's PC";
+    raw_endpoint_info.push(dev_name.len() as u8);
+    raw_endpoint_info.extend_from_slice(dev_name);
+
+    let offline_frame = OfflineFrame {
+        version: Some(1),
+        v1: Some(ConnectionsV1Frame {
+            r#type: Some(ConnectionsFrameType::ConnectionRequest as i32),
+            connection_request: Some(ConnectionRequestFrame {
+                endpoint_id: Some("2I0P".to_string()),
+                endpoint_name: Some(raw_endpoint_info.clone()),
+                handshake_data: None,
+                nonce: Some(12345),
+                mediums: vec![5],
+                endpoint_info: Some(raw_endpoint_info.clone()),
+                keep_alive_interval_millis: Some(5000),
+                keep_alive_timeout_millis: Some(30000),
+                device_type: Some(3),
+                device_info: None,
+                connection_mode: None,
+            }),
+            connection_response: None,
+            payload_transfer: None,
+            bandwidth_upgrade_negotiation: None,
+            keep_alive: None,
+            disconnection: None,
+            paired_key_encryption: None,
+            authentication_message: None,
+            authentication_result: None,
+        }),
+    };
+
+    let mut buf = Vec::new();
+    offline_frame.encode(&mut buf).expect("Encode failed");
+
+    // Decoding must succeed and NOT throw "invalid string value: data is not UTF-8 encoded"
+    let decoded =
+        OfflineFrame::decode(&buf[..]).expect("Decode of non-UTF8 endpoint_name must succeed");
+    let req = decoded.v1.unwrap().connection_request.unwrap();
+    let name = extract_clean_device_name(req.endpoint_name.as_ref().unwrap());
+    assert_eq!(name, "Aditya's PC");
+}
+
+#[tokio::test]
+async fn test_framed_reader_streaming_and_partial_chunks() {
+    use qshare_linux::transport::{write_length_prefixed_frame, FramedReader};
+    use tokio::io::duplex;
+
+    let (mut client, server) = duplex(1024);
+    let mut reader = FramedReader::new(server);
+
+    // Write 3 frames
+    let frame1 = b"Hello".to_vec();
+    let frame2 = b"QuickShare".to_vec();
+    let frame3 = vec![0x42u8; 10000];
+
+    let f1_clone = frame1.clone();
+    let f2_clone = frame2.clone();
+    let f3_clone = frame3.clone();
+
+    tokio::spawn(async move {
+        write_length_prefixed_frame(&mut client, &f1_clone).await.unwrap();
+        write_length_prefixed_frame(&mut client, &f2_clone).await.unwrap();
+        write_length_prefixed_frame(&mut client, &f3_clone).await.unwrap();
+    });
+
+    let r1 = reader.next_frame().await.unwrap();
+    assert_eq!(r1, frame1);
+
+    let r2 = reader.next_frame().await.unwrap();
+    assert_eq!(r2, frame2);
+
+    let r3 = reader.next_frame().await.unwrap();
+    assert_eq!(r3, frame3);
+}
+
 
